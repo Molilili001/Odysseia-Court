@@ -1,0 +1,8 @@
+.env
+.limcode/
+__pycache__/
+*.pyc
+data/*.db
+data/*.db-journal
+.vscode/
+.idea/
