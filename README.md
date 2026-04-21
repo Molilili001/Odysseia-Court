@@ -1,4 +1,4 @@
-# Discord 类脑大法庭 Bot（Python / discord.py）
+# Discord Odysseia-Count Bot
 
 在 Discord 服务器内提供一套结构化的“投诉 → 管理审核 → 开庭 → 回合制辩诉（自主发言）→ 管理裁决 → 一键归档并删除”流程，减少争吵与信息散落，并保留可追溯的案件记录。
 
@@ -31,7 +31,7 @@
   - 必须填写说明理由（Modal）。
 - **结案归档与删除**：
   - 结案或撤诉后，管理可点击 **“归档并删除”**。
-  - 导出 **DiscordChatExporter 风格 HTML**：
+  - 导出 **HTML**：
     - **图片优先**：尽量内嵌到 HTML（或打包 ZIP）。
     - 外部链接：仅记录 URL。
     - 非图片附件：仅记录 URL。
