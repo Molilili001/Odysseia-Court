@@ -24,19 +24,19 @@ class ReviewView(discord.ui.View):
 
         # 动态按钮（带 case_id 的 custom_id），用于 persistent view
         self.btn_approve_req = discord.ui.Button(
-            label="通过并开庭（按申请）",
+            label="通过并开始议诉（按申请）",
             style=discord.ButtonStyle.success,
             custom_id=f"court_review_approve_req_{case_id}",
             row=0,
         )
         self.btn_approve_private = discord.ui.Button(
-            label="通过并开庭（私密）",
+            label="通过并开始议诉（私密）",
             style=discord.ButtonStyle.success,
             custom_id=f"court_review_approve_private_{case_id}",
             row=0,
         )
         self.btn_approve_public = discord.ui.Button(
-            label="通过并开庭（公开）",
+            label="通过并开始议诉（公开）",
             style=discord.ButtonStyle.success,
             custom_id=f"court_review_approve_public_{case_id}",
             row=0,
@@ -84,7 +84,7 @@ class ReviewView(discord.ui.View):
     async def _on_approve_requested(self, interaction: discord.Interaction) -> None:
         case = await self.bot.repo.get_case(self.case_id)
         if not case:
-            await interaction.response.send_message("案件不存在。", ephemeral=True)
+            await interaction.response.send_message("未找到该议诉。", ephemeral=True)
             return
         await self._approve(interaction, case.get("requested_visibility"))
 
@@ -105,37 +105,37 @@ class ReviewView(discord.ui.View):
 
         settings = await self.bot.get_settings(interaction.guild.id)
         if not settings:
-            await interaction.response.send_message("本服务器尚未配置类脑大法庭，请先运行：/类脑大法庭 设置", ephemeral=True)
+            await interaction.response.send_message("本服务器尚未配置议诉系统，请先运行：/议诉 设置", ephemeral=True)
             return
 
         case = await self.bot.repo.get_case(self.case_id)
         if not case:
-            await interaction.response.send_message("案件不存在。", ephemeral=True)
+            await interaction.response.send_message("未找到该议诉。", ephemeral=True)
             return
 
         if case.get("status") not in (STATUS_UNDER_REVIEW, STATUS_NEEDS_MORE_EVIDENCE):
-            await interaction.response.send_message("该案件当前状态不允许开庭。", ephemeral=True)
+            await interaction.response.send_message("该议诉当前状态不允许开始议诉。", ephemeral=True)
             return
 
         approved_visibility = approved_visibility or case.get("requested_visibility")
         if approved_visibility not in (VIS_PRIVATE, VIS_PUBLIC):
             approved_visibility = VIS_PRIVATE
 
-        await interaction.response.send_message("正在创建庭审空间，请稍候...", ephemeral=True)
+        await interaction.response.send_message("正在创建议诉频道，请稍候...", ephemeral=True)
 
         await self.bot.repo.approve_case(self.case_id, approved_visibility)
         await self.bot.repo.log(self.case_id, "case_approved", interaction.user.id, {"approved_visibility": approved_visibility})
 
-        # 创建案件空间并发控制面板
+        # 创建议诉频道并发控制面板
         try:
             created_space = await self.bot.create_court_space(case_id=self.case_id, approved_visibility=approved_visibility)
         except Exception as e:
             # 出错时尽量回滚为待审核，避免卡死
-            await self.bot.repo.set_status(self.case_id, STATUS_UNDER_REVIEW, f"开庭失败：{e}")
-            await interaction.followup.send(f"开庭失败：{e}", ephemeral=True)
+            await self.bot.repo.set_status(self.case_id, STATUS_UNDER_REVIEW, f"开始议诉失败：{e}")
+            await interaction.followup.send(f"开始议诉失败：{e}", ephemeral=True)
             return
 
-        # 更新审核面板：移除按钮 + 写出最新状态 + 提供案件空间链接
+        # 更新审核面板：移除按钮 + 写出最新状态 + 提供议诉频道链接
         updated_case = await self.bot.repo.get_case(self.case_id)
         evidences = await self.bot.repo.list_evidence(self.case_id)
         if updated_case:
@@ -147,17 +147,17 @@ class ReviewView(discord.ui.View):
         # 给操作者一个直达链接（ephemeral）
         try:
             if created_space is not None and hasattr(created_space, "mention"):
-                await interaction.edit_original_response(content=f"已开庭：{created_space.mention}")
+                await interaction.edit_original_response(content=f"已开始议诉：{created_space.mention}")
             else:
-                await interaction.edit_original_response(content="已开庭。")
+                await interaction.edit_original_response(content="已开始议诉。")
         except Exception:
             pass
 
         await send_audit_log(
             bot=self.bot,
             audit_channel_id=settings.get("audit_log_channel_id"),
-            title="案件开庭",
-            description=f"案件 #{self.case_id} 已开庭（{approved_visibility}）。",
+            title="议诉开始",
+            description=f"议诉 #{self.case_id} 已开始议诉（{approved_visibility}）。",
             case_id=self.case_id,
             operator=interaction.user,
         )

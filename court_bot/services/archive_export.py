@@ -44,6 +44,11 @@ def fmt_dt(dt: datetime | None) -> str:
 _URL_RE = re.compile(r'(https?://[^\s<>"]+)')
 
 
+def _safe_bytes_to_data_url(mime: str, data: bytes) -> str:
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
 def render_discord_markdown(text: str) -> str:
     """轻量渲染：更像 DiscordChatExporter 的导出效果。
 
@@ -157,7 +162,7 @@ def _build_html(
 <head>
   <meta charset='utf-8'>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <title>案件归档</title>
+  <title>议诉归档</title>
   <style>{css}</style>
 </head>
 <body>
@@ -178,6 +183,8 @@ async def build_archive(
     channel: discord.TextChannel,
     header_lines: list[str],
     guild_filesize_limit: int,
+    media_budget_bytes: int | None = None,
+    single_image_max_bytes: int | None = None,
 ) -> ArchiveBuildResult:
     """导出频道为 DCE 风格 HTML（优先单文件，超限则 ZIP）。
 
@@ -188,6 +195,14 @@ async def build_archive(
     """
 
     warnings: list[str] = []
+    limit = max(1, int(guild_filesize_limit * 0.95))
+    configured_media_budget = max(0, int(media_budget_bytes if media_budget_bytes is not None else 32 * 1024 * 1024))
+    # media_budget/single_image_max 为 0 时表示不限制，保持完整离线归档能力。
+    media_budget = configured_media_budget
+    single_image_max = max(0, int(single_image_max_bytes if single_image_max_bytes is not None else 0))
+    offline_bytes_used = 0
+    skipped_budget = 0
+    skipped_oversize = 0
 
     messages: list[discord.Message] = []
     async for m in channel.history(limit=None, oldest_first=True):
@@ -195,6 +210,10 @@ async def build_archive(
 
     # 下载图片附件（Discord attachment），用于离线保存
     images: list[tuple[str, str, bytes]] = []  # (key, mime, data)
+
+    # 下载用户头像（用于离线保存，避免 CDN 过期导致裂图）
+    avatars: list[tuple[str, str, bytes]] = []  # (key, mime, data)
+    avatar_keys: set[str] = set()
 
     def guess_mime(filename: str, content_type: str | None) -> str:
         if content_type and content_type.startswith("image/"):
@@ -210,17 +229,96 @@ async def build_archive(
             return "image/webp"
         return "application/octet-stream"
 
+    def guess_avatar_mime(url: str) -> str:
+        u = (url or "").lower()
+        if ".png" in u:
+            return "image/png"
+        if ".jpg" in u or ".jpeg" in u:
+            return "image/jpeg"
+        if ".webp" in u:
+            return "image/webp"
+        if ".gif" in u:
+            return "image/gif"
+        return "image/png"
+
+    async def download_avatar_for(author: discord.abc.User) -> None:
+        nonlocal offline_bytes_used, skipped_budget
+
+        try:
+            url = getattr(getattr(author, "display_avatar", None), "url", None)
+            author_id = getattr(author, "id", None)
+            if not url or author_id is None:
+                return
+            key = f"av_{int(author_id)}"
+            if key in avatar_keys:
+                return
+            avatar_keys.add(key)
+
+            if media_budget > 0 and offline_bytes_used >= media_budget:
+                skipped_budget += 1
+                return
+
+            data = await author.display_avatar.read()
+            size = len(data)
+            if media_budget > 0 and offline_bytes_used + size > media_budget:
+                skipped_budget += 1
+                return
+
+            offline_bytes_used += size
+            avatars.append((key, guess_avatar_mime(str(url)), data))
+        except Exception:
+            # 头像下载失败不影响归档主体
+            return
+
+    def _attachment_too_large_before_download(att: discord.Attachment) -> bool:
+        size = int(getattr(att, "size", 0) or 0)
+        return bool(single_image_max and size and size > single_image_max)
+
+    def _attachment_exceeds_budget_before_download(att: discord.Attachment) -> bool:
+        size = int(getattr(att, "size", 0) or 0)
+        if media_budget > 0 and offline_bytes_used >= media_budget:
+            return True
+        return bool(media_budget > 0 and size and offline_bytes_used + size > media_budget)
+
     for m in messages:
+        # 收集头像
+        try:
+            await download_avatar_for(m.author)
+        except Exception:
+            pass
+
         for att in m.attachments:
             if not is_image_attachment(att):
                 continue
+            if _attachment_too_large_before_download(att):
+                skipped_oversize += 1
+                continue
+            if _attachment_exceeds_budget_before_download(att):
+                skipped_budget += 1
+                continue
+
             try:
                 data = await att.read()
             except Exception:
                 warnings.append(f"图片下载失败：{att.url}")
                 continue
+
+            data_size = len(data)
+            if single_image_max and data_size > single_image_max:
+                skipped_oversize += 1
+                continue
+            if media_budget > 0 and offline_bytes_used + data_size > media_budget:
+                skipped_budget += 1
+                continue
+
             key = f"{m.id}_{sanitize_filename(att.filename)}"
             images.append((key, guess_mime(att.filename, att.content_type), data))
+            offline_bytes_used += data_size
+
+    if skipped_oversize:
+        warnings.append(f"{skipped_oversize} 个图片资源超过单张离线上限，已仅保留原始链接。")
+    if skipped_budget:
+        warnings.append(f"{skipped_budget} 个图片/头像资源超过离线保存预算，已仅保留 CDN/原始链接。")
 
     # -------- 构造消息块（两种模式共用：inline / assets） --------
 
@@ -310,12 +408,18 @@ async def build_archive(
         inner = "".join(parts) or "<div class='embed-desc'>(空 Embed)</div>"
         return f"<div class='embed' style='border-left-color: {border};'>{inner}</div>"
 
-    def build_message_blocks(*, image_src: dict[str, str]) -> list[str]:
+    def build_message_blocks(*, image_src: dict[str, str], avatar_src: dict[str, str]) -> list[str]:
         blocks: list[str] = []
         for m in messages:
             author = m.author
-            name = html_escape.escape(getattr(author, "display_name", str(author)))
-            avatar = getattr(getattr(author, "display_avatar", None), "url", "")
+            author_id = getattr(author, "id", None)
+            display_name = getattr(author, "display_name", str(author))
+            name_text = f"{display_name}（{author_id}）" if author_id is not None else str(display_name)
+            name = html_escape.escape(name_text)
+            avatar_key = f"av_{int(author_id)}" if author_id is not None else None
+            avatar = avatar_src.get(avatar_key) if avatar_key else None
+            if not avatar:
+                avatar = getattr(getattr(author, "display_avatar", None), "url", "")
             avatar_html = f"<img class='avatar' src='{avatar}' />" if avatar else "<div class='avatar'></div>"
 
             ts = m.created_at.strftime("%Y/%m/%d %H:%M")
@@ -336,7 +440,15 @@ async def build_archive(
                 if is_image_attachment(att):
                     key = f"{m.id}_{sanitize_filename(att.filename)}"
                     src = image_src.get(key) or html_escape.escape(att.url)
-                    attach_lines.append(f"<div class='att'><img class='img' src='{src}' /></div>")
+                    origin = html_escape.escape(att.url)
+                    attach_lines.append(
+                        (
+                            "<div class='att'>"
+                            f"<a href='{origin}' target='_blank' rel='noreferrer'><img class='img' src='{src}' /></a>"
+                            f"<div class='file'>🔗 <a href='{origin}' target='_blank' rel='noreferrer'>原图链接</a></div>"
+                            "</div>"
+                        )
+                    )
                 else:
                     # 非图片仅记录 URL
                     url = html_escape.escape(att.url)
@@ -367,30 +479,53 @@ async def build_archive(
             )
         return blocks
 
-    header_html = "<h1>📌 案件归档</h1>" + "<div class='meta'>" + html_escape.escape("\n".join(header_lines)) + "</div>"
+    header_html = "<h1>📌 议诉归档</h1>" + "<div class='meta'>" + html_escape.escape("\n".join(header_lines)) + "</div>"
 
-    # 优先：单文件 HTML（base64 内嵌图片）
-    image_src_inline: dict[str, str] = {}
-    for key, mime, data in images:
-        b64 = base64.b64encode(data).decode("ascii")
-        image_src_inline[key] = f"data:{mime};base64,{b64}"
+    # 优先：单文件 HTML（base64 内嵌图片）。但 base64 会额外膨胀约 33%，
+    # 如果明显超过上传限制，就跳过这一步，避免在小内存 VPS 上制造无意义峰值。
+    estimated_inline_media_bytes = int(offline_bytes_used * 4 / 3) + 512 * (len(images) + len(avatars))
+    if estimated_inline_media_bytes <= limit:
+        image_src_inline: dict[str, str] = {}
+        for key, mime, data in images:
+            image_src_inline[key] = _safe_bytes_to_data_url(mime, data)
 
-    html_inline = _build_html(header_html=header_html, message_blocks=build_message_blocks(image_src=image_src_inline))
-    html_inline_bytes = html_inline.encode("utf-8")
+        avatar_src_inline: dict[str, str] = {}
+        for key, mime, data in avatars:
+            avatar_src_inline[key] = _safe_bytes_to_data_url(mime, data)
 
-    limit = int(guild_filesize_limit * 0.95)
-    if len(html_inline_bytes) <= limit:
-        return ArchiveBuildResult(mode="html", filename=f"archive-{channel.id}.html", data=html_inline_bytes, warnings=warnings)
+        html_inline = _build_html(
+            header_html=header_html,
+            message_blocks=build_message_blocks(image_src=image_src_inline, avatar_src=avatar_src_inline),
+        )
+        html_inline_bytes = html_inline.encode("utf-8")
+
+        if len(html_inline_bytes) <= limit:
+            return ArchiveBuildResult(mode="html", filename=f"archive-{channel.id}.html", data=html_inline_bytes, warnings=warnings)
+
+        del html_inline, html_inline_bytes, image_src_inline, avatar_src_inline
+    elif images or avatars:
+        warnings.append("离线资源较多：已跳过单文件内嵌，改用 ZIP 或链接降级以降低内存峰值。")
+
+    if offline_bytes_used > limit and (images or avatars):
+        warnings.append("离线资源体积超过上传限制：已跳过 ZIP 打包，仅保留 CDN/原始链接。")
+        html_urls = _build_html(header_html=header_html, message_blocks=build_message_blocks(image_src={}, avatar_src={}))
+        return ArchiveBuildResult(mode="html", filename=f"archive-{channel.id}-urls.html", data=html_urls.encode("utf-8"), warnings=warnings)
 
     # 超限：ZIP（index.html + assets）
     image_src_assets: dict[str, str] = {key: f"assets/{key}" for key, _, _ in images}
-    html_assets = _build_html(header_html=header_html, message_blocks=build_message_blocks(image_src=image_src_assets))
+    avatar_src_assets: dict[str, str] = {key: f"assets/avatars/{key}" for key, _, _ in avatars}
+    html_assets = _build_html(
+        header_html=header_html,
+        message_blocks=build_message_blocks(image_src=image_src_assets, avatar_src=avatar_src_assets),
+    )
 
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("index.html", html_assets.encode("utf-8"))
         for key, _, data in images:
             z.writestr(f"assets/{key}", data)
+        for key, _, data in avatars:
+            z.writestr(f"assets/avatars/{key}", data)
 
     zip_bytes = mem.getvalue()
     if len(zip_bytes) <= limit:
@@ -398,5 +533,5 @@ async def build_archive(
 
     # 仍超限：降级（不内嵌、不打包图片，仅保留 URL）
     warnings.append("归档文件过大：已降级为仅记录图片 URL（未离线保存）。")
-    html_urls = _build_html(header_html=header_html, message_blocks=build_message_blocks(image_src={}))
+    html_urls = _build_html(header_html=header_html, message_blocks=build_message_blocks(image_src={}, avatar_src={}))
     return ArchiveBuildResult(mode="html", filename=f"archive-{channel.id}-urls.html", data=html_urls.encode("utf-8"), warnings=warnings)

@@ -10,7 +10,7 @@ COLOR_ORANGE = 0xE67E22
 VIS_PRIVATE = "private"
 VIS_PUBLIC = "public"
 
-# 案件状态
+# 议诉状态
 STATUS_UNDER_REVIEW = "under_review"
 STATUS_NEEDS_MORE_EVIDENCE = "needs_more_evidence"
 STATUS_REJECTED = "rejected"
@@ -33,7 +33,7 @@ ROUND_LABEL = {
 
 
 def round_label(round_number: int) -> str:
-    return ROUND_LABEL.get(round_number, "追加辩诉")
+    return ROUND_LABEL.get(round_number, "追加议诉")
 
 
 def side_label(side: str) -> str:

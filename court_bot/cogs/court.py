@@ -7,6 +7,7 @@ from discord.ext import commands
 
 from ..constants import VIS_PRIVATE, VIS_PUBLIC
 from ..views.modals import AddEvidenceModal, ApplyCourtModal
+from ..views.entry import EntryView, build_entry_embed
 
 
 class CourtGroup(app_commands.Group):
@@ -16,17 +17,17 @@ class CourtGroup(app_commands.Group):
             # 通过 localizations 让客户端显示中文（也能覆盖英文客户端）。
             name=locale_str(
                 "court",
-                zh_CN="类脑大法庭",
-                zh_TW="類腦大法庭",
-                en_US="类脑大法庭",
-                en_GB="类脑大法庭",
+                zh_CN="议诉",
+                zh_TW="議訴",
+                en_US="议诉",
+                en_GB="议诉",
             ),
             description=locale_str(
-                "Court case system",
-                zh_CN="类脑大法庭案件系统",
-                zh_TW="類腦大法庭案件系統",
-                en_US="类脑大法庭案件系统",
-                en_GB="类脑大法庭案件系统",
+                "Yisu system",
+                zh_CN="议诉系统",
+                zh_TW="議訴系統",
+                en_US="议诉系统",
+                en_GB="议诉系统",
             ),
         )
         self.bot = bot
@@ -34,22 +35,22 @@ class CourtGroup(app_commands.Group):
     @app_commands.command(
         name=locale_str(
             "apply",
-            zh_CN="申请开庭",
-            zh_TW="申請開庭",
-            en_US="申请开庭",
-            en_GB="申请开庭",
+            zh_CN="申请",
+            zh_TW="申請",
+            en_US="申请",
+            en_GB="申请",
         ),
         description=locale_str(
             "Submit a complaint and apply for a trial",
-            zh_CN="提交投诉并申请开庭",
-            zh_TW="提交投訴並申請開庭",
-            en_US="提交投诉并申请开庭",
-            en_GB="提交投诉并申请开庭",
+            zh_CN="提交投诉并申请议诉",
+            zh_TW="提交投訴並申請議訴",
+            en_US="提交投诉并申请议诉",
+            en_GB="提交投诉并申请议诉",
         ),
     )
     @app_commands.rename(
         defendant=locale_str("defendant", zh_CN="被投诉人", zh_TW="被投訴人", en_US="被投诉人", en_GB="被投诉人"),
-        visibility=locale_str("visibility", zh_CN="开庭模式", zh_TW="開庭模式", en_US="开庭模式", en_GB="开庭模式"),
+        visibility=locale_str("visibility", zh_CN="议诉模式", zh_TW="議訴模式", en_US="议诉模式", en_GB="议诉模式"),
         evidence_link=locale_str("evidence_link", zh_CN="证据链接", zh_TW="證據連結", en_US="证据链接", en_GB="证据链接"),
         evidence1=locale_str("evidence1", zh_CN="证据附件1", zh_TW="證據附件1", en_US="证据附件1", en_GB="证据附件1"),
         evidence2=locale_str("evidence2", zh_CN="证据附件2", zh_TW="證據附件2", en_US="证据附件2", en_GB="证据附件2"),
@@ -57,7 +58,7 @@ class CourtGroup(app_commands.Group):
     )
     @app_commands.describe(
         defendant="被投诉人",
-        visibility="开庭模式（公开/私密）",
+        visibility="议诉模式（公开/私密）",
         evidence_link="证据链接（可选）",
         evidence1="证据附件 1（可选）",
         evidence2="证据附件 2（可选）",
@@ -79,7 +80,7 @@ class CourtGroup(app_commands.Group):
         evidence2: discord.Attachment | None = None,
         evidence3: discord.Attachment | None = None,
     ) -> None:
-        """用户提交投诉并申请开庭。"""
+        """用户提交投诉并申请议诉。"""
 
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
@@ -88,7 +89,7 @@ class CourtGroup(app_commands.Group):
         settings = await self.bot.get_settings(interaction.guild.id)
         if not settings or not settings.get("review_channel_id"):
             await interaction.response.send_message(
-                "本服务器尚未配置类脑大法庭，请先由管理执行：/类脑大法庭 设置",
+                "本服务器尚未配置议诉系统，请先由管理执行：/议诉 设置",
                 ephemeral=True,
             )
             return
@@ -113,21 +114,21 @@ class CourtGroup(app_commands.Group):
         ),
         description=locale_str(
             "Add evidence to a case",
-            zh_CN="为案件补充证据（支持附件）",
-            zh_TW="為案件補充證據（支援附件）",
-            en_US="为案件补充证据（支持附件）",
-            en_GB="为案件补充证据（支持附件）",
+            zh_CN="为议诉补充证据；可在任意频道填写议诉编号使用",
+            zh_TW="為議訴補充證據；可在任意頻道填寫議訴編號使用",
+            en_US="为议诉补充证据；可在任意频道填写议诉编号使用",
+            en_GB="为议诉补充证据；可在任意频道填写议诉编号使用",
         ),
     )
     @app_commands.rename(
-        case_id=locale_str("case_id", zh_CN="案件编号", zh_TW="案件編號", en_US="案件编号", en_GB="案件编号"),
+        case_id=locale_str("case_id", zh_CN="议诉编号", zh_TW="議訴編號", en_US="议诉编号", en_GB="议诉编号"),
         evidence_link=locale_str("evidence_link", zh_CN="证据链接", zh_TW="證據連結", en_US="证据链接", en_GB="证据链接"),
         evidence1=locale_str("evidence1", zh_CN="证据附件1", zh_TW="證據附件1", en_US="证据附件1", en_GB="证据附件1"),
         evidence2=locale_str("evidence2", zh_CN="证据附件2", zh_TW="證據附件2", en_US="证据附件2", en_GB="证据附件2"),
         evidence3=locale_str("evidence3", zh_CN="证据附件3", zh_TW="證據附件3", en_US="证据附件3", en_GB="证据附件3"),
     )
     @app_commands.describe(
-        case_id="案件编号（可选：若在案件频道/帖子内使用可不填）",
+        case_id="议诉编号（可选；可在任意频道填写编号使用，在对应议诉频道内可不填）",
         evidence_link="证据链接（可选）",
         evidence1="证据附件 1（可选）",
         evidence2="证据附件 2（可选）",
@@ -146,7 +147,7 @@ class CourtGroup(app_commands.Group):
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
 
-        # 允许在案件频道/帖子内不填 case_id：通过 channel/thread 反查
+        # 允许在议诉频道内不填 case_id：通过 channel/thread 反查
         target_case = None
         if case_id is not None:
             target_case = await self.bot.repo.get_case(case_id)
@@ -154,7 +155,10 @@ class CourtGroup(app_commands.Group):
             target_case = await self.bot.repo.find_case_by_space_id(interaction.guild.id, interaction.channel_id)
 
         if not target_case:
-            await interaction.response.send_message("无法定位案件。请在案件频道/帖子内使用，或填写 case_id。", ephemeral=True)
+            await interaction.response.send_message(
+                "无法定位议诉。请填写议诉编号，或在对应议诉频道内使用本指令。",
+                ephemeral=True,
+            )
             return
 
         # 打开 modal 让用户填写“证据说明”
@@ -177,10 +181,10 @@ class CourtGroup(app_commands.Group):
         ),
         description=locale_str(
             "Configure court bot for this guild",
-            zh_CN="配置本服务器类脑大法庭（频道/身份组等）",
-            zh_TW="設定本伺服器類腦大法庭（頻道/身分組等）",
-            en_US="配置本服务器类脑大法庭（频道/身份组等）",
-            en_GB="配置本服务器类脑大法庭（频道/身份组等）",
+            zh_CN="配置本服务器议诉系统（频道/身份组等）",
+            zh_TW="設定本伺服器議訴系統（頻道/身分組等）",
+            en_US="配置本服务器议诉系统（频道/身份组等）",
+            en_GB="配置本服务器议诉系统（频道/身份组等）",
         ),
     )
     @app_commands.rename(
@@ -188,7 +192,7 @@ class CourtGroup(app_commands.Group):
         admin_role2=locale_str("admin_role2", zh_CN="管理身份组2", zh_TW="管理身分組2", en_US="管理身份组2", en_GB="管理身份组2"),
         admin_role3=locale_str("admin_role3", zh_CN="管理身份组3", zh_TW="管理身分組3", en_US="管理身份组3", en_GB="管理身份组3"),
         review_channel=locale_str("review_channel", zh_CN="审核频道", zh_TW="審核頻道", en_US="审核频道", en_GB="审核频道"),
-        court_category=locale_str("court_category", zh_CN="庭审分类", zh_TW="庭審分類", en_US="庭审分类", en_GB="庭审分类"),
+        court_category=locale_str("court_category", zh_CN="议诉分类", zh_TW="議訴分類", en_US="议诉分类", en_GB="议诉分类"),
         judge_panel_channel=locale_str("judge_panel_channel", zh_CN="裁决频道", zh_TW="裁決頻道", en_US="裁决频道", en_GB="裁决频道"),
         audience_role=locale_str("audience_role", zh_CN="观众身份组", zh_TW="觀眾身分組", en_US="观众身份组", en_GB="观众身份组"),
         archive_channel=locale_str("archive_channel", zh_CN="归档频道", zh_TW="歸檔頻道", en_US="归档频道", en_GB="归档频道"),
@@ -199,9 +203,9 @@ class CourtGroup(app_commands.Group):
         admin_role2="管理身份组 2（可选）",
         admin_role3="管理身份组 3（可选）",
         review_channel="管理审核频道",
-        court_category="庭审案件分类（Category）",
+        court_category="议诉分类（Category）",
         judge_panel_channel="裁决面板频道（管理私密）",
-        audience_role="公开案件观众身份组（只读，可选）",
+        audience_role="公开议诉观众身份组（只读，可选）",
         archive_channel="归档频道（仅管理可见）",
         audit_log_channel="审计日志频道（可选）",
     )
@@ -268,16 +272,75 @@ class CourtGroup(app_commands.Group):
             admin_roles_text += f"、{admin_role3.mention}"
 
         await interaction.response.send_message(
-            "已保存类脑大法庭设置：\n"
+            "已保存议诉系统设置：\n"
             f"- 管理身份组：{admin_roles_text}\n"
             f"- 审核频道：{review_channel.mention}\n"
-            f"- 庭审分类：{court_category.name}\n"
+            f"- 议诉分类：{court_category.name}\n"
             f"- 裁决频道：{judge_panel_channel.mention}\n"
             f"- 归档频道：{archive_channel.mention}\n"
             f"- 观众身份组：{audience_text}\n"
             f"- 审计频道：{audit_text}",
             ephemeral=True,
         )
+
+    @app_commands.command(
+        name=locale_str(
+            "setup_entry",
+            zh_CN="入口",
+            zh_TW="入口",
+            en_US="入口",
+            en_GB="入口",
+        ),
+        description=locale_str(
+            "Post the public application entry panel",
+            zh_CN="发布带提交议诉申请按钮的入口面板",
+            zh_TW="發布帶提交議訴申請按鈕的入口面板",
+            en_US="发布带提交议诉申请按钮的入口面板",
+            en_GB="发布带提交议诉申请按钮的入口面板",
+        ),
+    )
+    @app_commands.rename(
+        details=locale_str("details", zh_CN="详细说明", zh_TW="詳細說明", en_US="详细说明", en_GB="详细说明"),
+    )
+    @app_commands.describe(
+        details="议诉区用法说明（可选；支持换行，过长请精简到 3500 字以内）",
+    )
+    async def setup_entry(self, interaction: discord.Interaction, details: str | None = None) -> None:
+        """由管理在当前频道发布议诉申请入口面板。"""
+
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+
+        if not await self.bot.is_admin(interaction.user, interaction.guild):
+            await interaction.response.send_message("无权限（需要议诉系统管理身份组）。", ephemeral=True)
+            return
+
+        settings = await self.bot.get_settings(interaction.guild.id)
+        if not settings or not settings.get("review_channel_id"):
+            await interaction.response.send_message(
+                "本服务器尚未配置议诉系统，请先执行：/议诉 设置",
+                ephemeral=True,
+            )
+            return
+
+        description = (details or "").strip() or None
+        if description and len(description) > 3500:
+            await interaction.response.send_message("详细说明过长，请精简到 3500 字以内后重试。", ephemeral=True)
+            return
+
+        if interaction.channel is None:
+            await interaction.response.send_message("无法定位当前频道。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await interaction.channel.send(embed=build_entry_embed(description), view=EntryView(bot=self.bot))
+        except Exception as e:
+            await interaction.edit_original_response(content=f"发布入口面板失败：{e}")
+            return
+
+        await interaction.edit_original_response(content="已在当前频道发布议诉申请入口面板。")
 
     @app_commands.command(
         name=locale_str(
@@ -289,10 +352,10 @@ class CourtGroup(app_commands.Group):
         ),
         description=locale_str(
             "Show current settings",
-            zh_CN="查看本服务器类脑大法庭设置",
-            zh_TW="查看本伺服器類腦大法庭設定",
-            en_US="查看本服务器类脑大法庭设置",
-            en_GB="查看本服务器类脑大法庭设置",
+            zh_CN="查看本服务器议诉系统设置",
+            zh_TW="查看本伺服器議訴系統設定",
+            en_US="查看本服务器议诉系统设置",
+            en_GB="查看本服务器议诉系统设置",
         ),
     )
     async def show_settings(self, interaction: discord.Interaction) -> None:
@@ -302,7 +365,7 @@ class CourtGroup(app_commands.Group):
 
         settings = await self.bot.get_settings(interaction.guild.id)
         if not settings:
-            await interaction.response.send_message("本服务器尚未配置类脑大法庭。请先执行：/类脑大法庭 设置", ephemeral=True)
+            await interaction.response.send_message("本服务器尚未配置议诉系统。请先执行：/议诉 设置", ephemeral=True)
             return
 
         admin_roles = "、".join(f"<@&{rid}>" for rid in (settings.get("admin_role_ids") or [])) or "（未设置）"
@@ -314,10 +377,10 @@ class CourtGroup(app_commands.Group):
         audience = f"<@&{audience_role_id}>" if audience_role_id else "（未设置）"
 
         await interaction.response.send_message(
-            "当前类脑大法庭设置：\n"
+            "当前议诉系统设置：\n"
             f"- 管理身份组：{admin_roles}\n"
             f"- 审核频道：<#{settings.get('review_channel_id')}>\n"
-            f"- 庭审分类（ID）：`{settings.get('court_category_id')}`\n"
+            f"- 议诉分类（ID）：`{settings.get('court_category_id')}`\n"
             f"- 裁决频道：<#{settings.get('judge_panel_channel_id')}>\n"
             f"- 归档频道：{archive}\n"
             f"- 观众身份组：{audience}\n"

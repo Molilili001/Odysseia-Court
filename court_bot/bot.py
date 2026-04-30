@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import logging
 import re
@@ -47,7 +48,15 @@ class CourtBot(commands.Bot):
         # 归档导出（HTML）与回合发言监管需要读取消息内容（需要在开发者后台开启 Message Content Intent）
         intents.message_content = True
 
-        super().__init__(command_prefix="!", intents=intents)
+        # 小型 VPS 优化：降低 Discord.py 的消息/成员缓存占用。
+        # 本项目主要依赖交互对象与按需 fetch_member，不需要完整成员缓存。
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            max_messages=config.max_message_cache,
+            member_cache_flags=discord.MemberCacheFlags.none(),
+            chunk_guilds_at_startup=False,
+        )
         self.config = config
 
         self.db = Database(config.db_path)
@@ -57,6 +66,7 @@ class CourtBot(commands.Bot):
 
         self._turn_timeout_task: asyncio.Task | None = None
         self._case_locks: dict[int, asyncio.Lock] = {}
+        self._archive_semaphore = asyncio.Semaphore(config.archive_concurrency)
 
     # -------------------- 权限/工具方法 --------------------
 
@@ -105,7 +115,7 @@ class CourtBot(commands.Bot):
         return bool(member.guild_permissions.administrator or member.guild_permissions.manage_guild)
 
     async def admin_mention(self, guild_id: int) -> str:
-        """用于案件空间里 @ 管理（只取第一个管理身份组避免 ping 太多）。"""
+        """用于议诉频道里 @ 管理（只取第一个管理身份组避免 ping 太多）。"""
 
         settings = await self.get_settings(guild_id)
         if settings:
@@ -131,6 +141,13 @@ class CourtBot(commands.Bot):
             lock = asyncio.Lock()
             self._case_locks[case_id] = lock
         return lock
+
+    def forget_case_runtime_state(self, case_id: int) -> None:
+        """释放已结束议诉的进程内临时状态，避免长期运行时小对象累积。"""
+
+        lock = self._case_locks.get(int(case_id))
+        if lock is not None and not lock.locked():
+            self._case_locks.pop(int(case_id), None)
 
 
     async def get_case_space(self, case: dict) -> Optional[discord.abc.Messageable]:
@@ -166,7 +183,7 @@ class CourtBot(commands.Bot):
         return member.display_name
 
     async def build_court_title(self, case: dict, guild: discord.Guild) -> str:
-        """生成开庭空间标题。
+        """生成开始议诉空间标题。
 
         格式（用户要求）：
         时间｜投诉人名投诉被投诉人名｜违反：xxxx
@@ -255,6 +272,8 @@ class CourtBot(commands.Bot):
             self._turn_timeout_task.cancel()
             try:
                 await self._turn_timeout_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
 
@@ -265,7 +284,7 @@ class CourtBot(commands.Bot):
         log.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "?")
 
     async def on_message(self, message: discord.Message) -> None:
-        """案件频道纪律兜底。
+        """议诉频道纪律兜底。
 
         - 非当前发言者（且非管理）发言将被删除
         - 当前发言者发言计数，达到上限自动结束本轮
@@ -277,12 +296,12 @@ class CourtBot(commands.Bot):
             if message.guild is None:
                 return
 
-            # 仅处理“案件频道”
+            # 仅处理“议诉频道”
             case = await self.repo.find_case_by_space_id(message.guild.id, message.channel.id)
             if not case:
                 return
 
-            # 非庭审中：一律不允许当事人/观众发言（防止权限误配）
+            # 非议诉中：一律不允许当事人/观众发言（防止权限误配）
             if case.get("status") != STATUS_IN_SESSION:
                 if not await self.is_admin(message.author, message.guild):
                     try:
@@ -370,7 +389,9 @@ class CourtBot(commands.Bot):
         from .views.continue_panel import ContinueView
         from .views.judgement import JudgementView
         from .views.archive import ArchiveView
+        from .views.entry import EntryView
 
+        self.add_view(EntryView(bot=self))
         cases = await self.repo.list_cases_for_restore()
         for c in cases:
             cid = int(c["id"])
@@ -384,7 +405,7 @@ class CourtBot(commands.Bot):
                     self.add_view(view)
 
             if status == STATUS_IN_SESSION:
-                # 全局注册（不绑定 message_id）：使同一案件频道内的任意“系统消息按钮”也能在重启后继续工作
+                # 全局注册（不绑定 message_id）：使同一议诉频道内的任意“系统消息按钮”也能在重启后继续工作
                 view = CourtView(bot=self, case_id=cid)
                 self.add_view(view)
 
@@ -411,7 +432,7 @@ class CourtBot(commands.Bot):
 
         log.info("Restored persistent views: %s cases", len(cases))
 
-    # -------------------- 开庭：创建案件空间 + 控制面板 --------------------
+    # -------------------- 开始议诉：创建议诉频道 + 控制面板 --------------------
 
     async def create_court_space(self, *, case_id: int, approved_visibility: str) -> Optional[discord.abc.Messageable]:
         case = await self.repo.get_case(case_id)
@@ -429,18 +450,18 @@ class CourtBot(commands.Bot):
 
         settings = await self.get_settings(guild.id)
         if not settings:
-            raise RuntimeError("本服务器尚未配置类脑大法庭。请先运行：/类脑大法庭 设置")
+            raise RuntimeError("本服务器尚未配置议诉系统。请先运行：/议诉 设置")
 
         court_category_id = settings.get("court_category_id")
         if not court_category_id:
-            raise RuntimeError("未配置‘庭审分类’，请先运行：/类脑大法庭 设置")
+            raise RuntimeError("未配置‘议诉分类’，请先运行：/议诉 设置")
 
         admin_role_ids: set[int] = settings.get("admin_role_ids") or set()
         if not admin_role_ids:
-            raise RuntimeError("未配置‘管理身份组’，请先运行：/类脑大法庭 设置")
+            raise RuntimeError("未配置‘管理身份组’，请先运行：/议诉 设置")
 
         if approved_visibility == VIS_PUBLIC and not settings.get("audience_role_id"):
-            raise RuntimeError("未配置‘观众身份组’，无法创建公开案件。请先运行：/类脑大法庭 设置")
+            raise RuntimeError("未配置‘观众身份组’，无法创建公开议诉。请先运行：/议诉 设置")
 
         category = guild.get_channel(int(court_category_id))
         if not isinstance(category, discord.CategoryChannel):
@@ -482,7 +503,7 @@ class CourtBot(commands.Bot):
                     use_application_commands=True,
                 )
 
-        # 公开案件：观众只读可见
+        # 公开议诉：观众只读可见
         audience_role_id = settings.get("audience_role_id")
         if approved_visibility == VIS_PUBLIC and audience_role_id:
             audience_role = guild.get_role(int(audience_role_id))
@@ -544,7 +565,7 @@ class CourtBot(commands.Bot):
         opening_embed = build_opening_post_embed(case, evidences)
         await channel.send(
             content=(
-                f"{admin_ping} 已开庭（{vis_label}）。\n"
+                f"{admin_ping} 已开始议诉（{vis_label}）。\n"
                 f"投诉人：<@{case['complainant_id']}>\n"
                 f"被投诉人：<@{case['defendant_id']}>"
             ),
@@ -561,8 +582,8 @@ class CourtBot(commands.Bot):
         await send_audit_log(
             bot=self,
             audit_channel_id=settings.get("audit_log_channel_id"),
-            title="创建案件频道",
-            description=f"案件 #{case['id']} 已创建频道（{vis_label}）：{channel.mention}",
+            title="创建议诉频道",
+            description=f"议诉 #{case['id']} 已创建频道（{vis_label}）：{channel.mention}",
             case_id=int(case["id"]),
         )
 
@@ -599,40 +620,49 @@ class CourtBot(commands.Bot):
             self.add_view(view)
 
         try:
-            # 当案件不在庭审中（待裁决/已结案/撤诉等）时移除按钮，避免误操作
+            # 当议诉不在进行中（待裁决/已结案/撤诉等）时移除按钮，避免误操作
             await msg.edit(embed=build_court_panel_embed(case), view=view)
         except Exception:
             pass
 
 
 
-    async def refresh_review_message(self, case: dict) -> None:
-        """刷新管理审核频道的案件卡片。
+    async def refresh_review_message(self, case: dict, *, keep_review_actions: bool = False) -> bool:
+        """刷新管理审核频道的议诉卡片。
 
         用途：
         - 裁决/结案后，原审核面板应同步显示“已结案”等状态
-        - 归档并删除后，去除庭审地址（频道已不存在）
+        - 归档并删除后，去除议诉频道（频道已不存在）
         """
 
         ch_id = case.get("review_channel_id")
         msg_id = case.get("review_message_id")
         if not ch_id or not msg_id:
-            return
+            return False
 
         ch = await self.get_channel_or_thread(int(ch_id))
         if ch is None or not isinstance(ch, discord.TextChannel):
-            return
+            return False
 
         try:
             msg = await ch.fetch_message(int(msg_id))
         except Exception:
-            return
+            return False
 
         evidences = await self.repo.list_evidence(int(case["id"]))
         try:
-            await msg.edit(embed=build_case_review_embed(case, evidences), view=None)
+            view = None
+            if keep_review_actions and case.get("status") in (STATUS_UNDER_REVIEW, STATUS_NEEDS_MORE_EVIDENCE):
+                from .views.review import ReviewView
+
+                view = ReviewView(bot=self, case_id=int(case["id"]))
+                self.add_view(view)
+
+            await msg.edit(embed=build_case_review_embed(case, evidences), view=view)
+            return True
         except Exception:
-            pass
+            log.exception("Failed to refresh review message for case %s", case.get("id"))
+            raise
 
 
     # -------------------- 自主发言回合：发言权授予/撤回 --------------------
@@ -651,10 +681,10 @@ class CourtBot(commands.Bot):
 
         case = await self.repo.get_case(case_id)
         if not case:
-            raise RuntimeError("案件不存在")
+            raise RuntimeError("未找到该议诉")
 
         if case.get("status") != STATUS_IN_SESSION:
-            raise RuntimeError("当前案件不在庭审中")
+            raise RuntimeError("当前议诉不在进行中")
 
         current_side = case.get("current_side") or SIDE_COMPLAINANT
         expected_id = int(case["complainant_id"]) if current_side == SIDE_COMPLAINANT else int(case["defendant_id"])
@@ -667,7 +697,7 @@ class CourtBot(commands.Bot):
 
         space = await self.get_case_space(case)
         if not isinstance(space, discord.TextChannel):
-            raise RuntimeError("无法找到案件频道")
+            raise RuntimeError("无法找到议诉频道")
 
         expires_dt = datetime.now(timezone.utc) + timedelta(minutes=TURN_SPEAK_MINUTES)
         expires_at = expires_dt.isoformat()
@@ -692,7 +722,7 @@ class CourtBot(commands.Bot):
                     read_message_history=True,
                     use_application_commands=True,
                 ),
-                reason=f"案件 #{case_id} 本轮发言权授予",
+                reason=f"议诉 #{case_id} 本轮发言权授予",
             )
         except Exception as e:
             # 回滚 turn_state
@@ -740,10 +770,10 @@ class CourtBot(commands.Bot):
 
         case = await self.repo.get_case(case_id)
         if not case:
-            raise RuntimeError("案件不存在")
+            raise RuntimeError("未找到该议诉")
 
         if case.get("status") != STATUS_IN_SESSION:
-            # 若案件已不在庭审中，理论上不应存在 turn_state；这里做防御性清理。
+            # 若议诉已不在进行中，理论上不应存在 turn_state；这里做防御性清理。
             await self.repo.clear_turn_state(case_id)
             return case
 
@@ -755,7 +785,7 @@ class CourtBot(commands.Bot):
         space = await self.get_case_space(case)
         if not isinstance(space, discord.TextChannel):
             await self.repo.clear_turn_state(case_id)
-            raise RuntimeError("无法找到案件频道")
+            raise RuntimeError("无法找到议诉频道")
 
         speaker_id = int(st.get("speaker_id") or 0)
         guild = space.guild
@@ -778,7 +808,7 @@ class CourtBot(commands.Bot):
                         read_message_history=True,
                         use_application_commands=True,
                     ),
-                    reason=f"案件 #{case_id} 结束本轮发言",
+                    reason=f"议诉 #{case_id} 结束本轮发言",
                 )
             except Exception:
                 pass
@@ -807,13 +837,13 @@ class CourtBot(commands.Bot):
         )
 
         if updated_case.get("status") == STATUS_AWAITING_CONTINUE:
-            await space.send("【系统】已完成本轮发言，进入‘是否继续辩诉’投票阶段。")
+            await space.send("【系统】已完成本轮发言，进入‘是否继续议诉’投票阶段。")
             await self.enter_continue_panel(updated_case)
             return updated_case
 
         if updated_case.get("status") == STATUS_AWAITING_JUDGEMENT:
             # 兜底：若未来状态机直接进入裁决
-            await space.send("【系统】辩诉已结束，进入裁决。")
+            await space.send("【系统】议诉已结束，进入裁决。")
             await self.enter_judgement(updated_case)
             return updated_case
 
@@ -827,7 +857,7 @@ class CourtBot(commands.Bot):
         return updated_case
 
     async def enter_continue_panel(self, case: dict) -> None:
-        """三辩结束后，发送“是否继续辩诉”面板到案件空间。"""
+        """三辩结束后，发送“是否继续议诉”面板到议诉频道。"""
 
         if case.get("status") != STATUS_AWAITING_CONTINUE:
             return
@@ -853,13 +883,13 @@ class CourtBot(commands.Bot):
         await send_audit_log(
             bot=self,
             audit_channel_id=settings.get("audit_log_channel_id") if settings else None,
-            title="进入继续/结束辩诉投票",
-            description=f"案件 #{case['id']} 已进入‘是否继续辩诉’阶段。",
+            title="进入继续/结束议诉投票",
+            description=f"议诉 #{case['id']} 已进入‘是否继续议诉’阶段。",
             case_id=int(case["id"]),
         )
 
     async def enter_judgement(self, case: dict) -> None:
-        """庭审结束后，向管理裁决频道发送单击式裁决面板。"""
+        """议诉结束后，向管理裁决频道发送单击式裁决面板。"""
 
         # 只在 awaiting_judgement 状态触发
         if case.get("status") != STATUS_AWAITING_JUDGEMENT:
@@ -870,7 +900,7 @@ class CourtBot(commands.Bot):
             # 没配置裁决频道时，不阻断结案，但需要管理手动处理
             space = await self.get_case_space(case)
             if space is not None:
-                await space.send("【系统】本服务器未配置‘裁决面板频道’，请管理先运行：/类脑大法庭 设置")
+                await space.send("【系统】本服务器未配置‘裁决面板频道’，请管理先运行：/议诉 设置")
             return
 
         judge_channel = await self.get_channel_or_thread(int(settings["judge_panel_channel_id"]))
@@ -883,9 +913,9 @@ class CourtBot(commands.Bot):
         self.add_view(view)
 
         msg = await judge_channel.send(
-            content=f"案件 #{case['id']} 辩诉已结束，等待裁决。",
+            content=f"议诉 #{case['id']} 已结束，等待裁决。",
             embed=discord.Embed(
-                title=f"案件 #{case['id']}｜裁决面板",
+                title=f"议诉 #{case['id']}｜裁决面板",
                 description=(
                     f"投诉人：<@{case['complainant_id']}>\n"
                     f"被投诉人：<@{case['defendant_id']}>\n\n"
@@ -903,7 +933,7 @@ class CourtBot(commands.Bot):
             bot=self,
             audit_channel_id=settings.get("audit_log_channel_id") if settings else None,
             title="进入裁决",
-            description=f"案件 #{case['id']} 已进入裁决阶段。",
+            description=f"议诉 #{case['id']} 已进入裁决阶段。",
             case_id=int(case["id"]),
         )
 
@@ -912,14 +942,14 @@ class CourtBot(commands.Bot):
     async def archive_and_delete_case(self, *, case_id: int, operator: discord.abc.User | None) -> None:
         case = await self.repo.get_case(case_id)
         if not case:
-            raise RuntimeError("案件不存在")
+            raise RuntimeError("未找到该议诉")
 
         if case.get("status") not in (STATUS_CLOSED, STATUS_WITHDRAWN):
-            raise RuntimeError("仅支持已结案/已撤诉案件归档")
+            raise RuntimeError("仅支持已结案/已撤诉议诉归档")
 
         settings = await self.get_settings(int(case["guild_id"]))
         if not settings or not settings.get("archive_channel_id"):
-            raise RuntimeError("未配置‘归档频道’，请先运行：/类脑大法庭 设置")
+            raise RuntimeError("未配置‘归档频道’，请先运行：/议诉 设置")
 
         archive_channel = await self.get_channel_or_thread(int(settings["archive_channel_id"]))
         if archive_channel is None or not isinstance(archive_channel, discord.TextChannel):
@@ -927,7 +957,7 @@ class CourtBot(commands.Bot):
 
         space = await self.get_case_space(case)
         if space is None or not isinstance(space, discord.TextChannel):
-            raise RuntimeError("无法找到案件频道")
+            raise RuntimeError("无法找到议诉频道")
 
         # 裁决信息（含理由）/ 撤诉信息
         judgement = await self.repo.get_latest_judgement(case_id)
@@ -959,14 +989,14 @@ class CourtBot(commands.Bot):
                 closed_at = None
 
         header_lines = [
-            f"案件编号：#{case_id}",
+            f"议诉编号：#{case_id}",
             f"频道：{space.name}（ID：{space.id}）",
-            f"开庭时间：{created_at.isoformat(sep=' ', timespec='minutes') if created_at else '未知'}",
+            f"开始议诉时间：{created_at.isoformat(sep=' ', timespec='minutes') if created_at else '未知'}",
             f"结案时间：{closed_at.isoformat(sep=' ', timespec='minutes') if closed_at else '未知'}",
             f"投诉人：{case.get('complainant_id')}",
             f"被投诉人：{case.get('defendant_id')}",
             f"违反规则：{case.get('rule_text')}",
-            f"案件说明：{case.get('description')}",
+            f"申请说明：{case.get('description')}",
             f"裁决：{decision or '未知'}",
             f"处罚/处置：{penalty or '无'}",
             f"裁决说明：{reason_text or '（无）'}",
@@ -975,63 +1005,77 @@ class CourtBot(commands.Bot):
         if operator:
             header_lines.append(f"归档操作人：{operator.id}")
 
-        result = await build_archive(
-            channel=space,
-            header_lines=header_lines,
-            guild_filesize_limit=int(space.guild.filesize_limit),
-        )
+        result = None
+        async with self._archive_semaphore:
+            try:
+                result = await build_archive(
+                    channel=space,
+                    header_lines=header_lines,
+                    guild_filesize_limit=int(space.guild.filesize_limit),
+                    media_budget_bytes=(
+                        int(self.config.archive_media_budget_mb) * 1024 * 1024 if self.config.archive_media_budget_mb > 0 else 0
+                    ),
+                    single_image_max_bytes=(
+                        int(self.config.archive_single_image_max_mb) * 1024 * 1024 if self.config.archive_single_image_max_mb > 0 else 0
+                    ),
+                )
 
-        # 发送到归档频道（仅管理可见）
-        summary = discord.Embed(
-            title=f"案件 #{case_id}｜归档",
-            description=f"已从 {space.mention} 导出为 {result.mode.upper()}。",
-            color=0x2B2D31,
-        )
-        summary.add_field(name="投诉人", value=f"<@{case['complainant_id']}> (`{case['complainant_id']}`)", inline=True)
-        summary.add_field(name="被投诉人", value=f"<@{case['defendant_id']}> (`{case['defendant_id']}`)", inline=True)
-        summary.add_field(name="裁决", value=f"{decision or '未知'}｜{penalty or '无'}", inline=False)
-        if reason_text:
-            summary.add_field(name="说明", value=str(reason_text)[:1024], inline=False)
-        if result.warnings:
-            summary.add_field(name="注意", value="\n".join(result.warnings)[:1024], inline=False)
-        if operator:
-            summary.set_footer(text=f"归档人：{operator.id}")
+                # 发送到归档频道（仅管理可见）
+                summary = discord.Embed(
+                    title=f"议诉 #{case_id}｜归档",
+                    description=f"已从 {space.mention} 导出为 {result.mode.upper()}。",
+                    color=0x2B2D31,
+                )
+                summary.add_field(name="投诉人", value=f"<@{case['complainant_id']}> (`{case['complainant_id']}`)", inline=True)
+                summary.add_field(name="被投诉人", value=f"<@{case['defendant_id']}> (`{case['defendant_id']}`)", inline=True)
+                summary.add_field(name="裁决", value=f"{decision or '未知'}｜{penalty or '无'}", inline=False)
+                if reason_text:
+                    summary.add_field(name="说明", value=str(reason_text)[:1024], inline=False)
+                if result.warnings:
+                    summary.add_field(name="注意", value="\n".join(result.warnings)[:1024], inline=False)
+                if operator:
+                    summary.set_footer(text=f"归档人：{operator.id}")
 
-        ext = "zip" if result.mode == "zip" else "html"
-        archive_filename = f"case-{case_id:04d}-archive.{ext}"
-        file = discord.File(fp=io.BytesIO(result.data), filename=archive_filename)
-        msg = await archive_channel.send(
-            embed=summary,
-            file=file,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+                ext = "zip" if result.mode == "zip" else "html"
+                archive_filename = f"case-{case_id:04d}-archive.{ext}"
+                file = discord.File(fp=io.BytesIO(result.data), filename=archive_filename)
+                msg = await archive_channel.send(
+                    embed=summary,
+                    file=file,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
 
-        await self.repo.log(
-            case_id,
-            "case_archived",
-            operator.id if operator else None,
-            {
-                "mode": result.mode,
-                "filename": archive_filename,
-                "archive_channel_id": int(archive_channel.id),
-                "archive_message_id": int(msg.id),
-                "warnings": result.warnings,
-            },
-        )
+                await self.repo.log(
+                    case_id,
+                    "case_archived",
+                    operator.id if operator else None,
+                    {
+                        "mode": result.mode,
+                        "filename": archive_filename,
+                        "archive_channel_id": int(archive_channel.id),
+                        "archive_message_id": int(msg.id),
+                        "warnings": result.warnings,
+                    },
+                )
 
-        # 清理案件空间引用，避免后续 restore 仍尝试挂载 view
-        await self.repo.clear_court_space(case_id)
+                # 清理议诉频道引用，避免后续 restore 仍尝试挂载 view
+                await self.repo.clear_court_space(case_id)
+                self.forget_case_runtime_state(case_id)
 
-        try:
-            updated_case = await self.repo.get_case(case_id)
-            if updated_case:
-                await self.refresh_review_message(updated_case)
-        except Exception:
-            pass
+                try:
+                    updated_case = await self.repo.get_case(case_id)
+                    if updated_case:
+                        await self.refresh_review_message(updated_case)
+                except Exception:
+                    pass
 
-        # 删除案件频道
-        try:
-            await space.delete(reason=f"案件 #{case_id} 已归档并删除")
-        except Exception as e:
-            raise RuntimeError(f"归档成功，但删除频道失败：{e}")
+                # 删除议诉频道
+                try:
+                    await space.delete(reason=f"议诉 #{case_id} 已归档并删除")
+                except Exception as e:
+                    raise RuntimeError(f"归档成功，但删除频道失败：{e}")
+            finally:
+                # 归档可能产生较大的 bytes/base64/zip 对象；归档结束后主动触发一次回收，降低小内存 VPS 峰值残留。
+                result = None
+                gc.collect()
 

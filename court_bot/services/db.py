@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS guild_settings (
   judge_panel_channel_id INTEGER,
   audit_log_channel_id INTEGER,
 
-  -- 新增：公开案件观众身份组（只读）
+  -- 新增：公开议诉观众身份组（只读）
   audience_role_id INTEGER,
   -- 新增：归档频道（仅管理可见）
   archive_channel_id INTEGER,
@@ -233,6 +233,21 @@ class Database:
         await self.conn.commit()
         return cur
 
+    async def insert_and_get_id(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        """执行 INSERT，返回 lastrowid，并及时关闭 cursor。"""
+
+        cur = await self.execute(sql, params)
+        try:
+            return int(cur.lastrowid)
+        finally:
+            await cur.close()
+
+    async def execute_close(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+        """执行不需要返回游标结果的 SQL，并及时关闭 cursor。"""
+
+        cur = await self.execute(sql, params)
+        await cur.close()
+
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> Optional[sqlite3.Row]:
         if self.conn is None:
             raise RuntimeError("DB not connected")
@@ -270,7 +285,7 @@ class CaseRepo:
         description: str,
     ) -> int:
         now = utc_now_iso()
-        cur = await self.db.execute(
+        return await self.db.insert_and_get_id(
             """
             INSERT INTO cases(
               guild_id,
@@ -293,7 +308,6 @@ class CaseRepo:
                 now,
             ),
         )
-        return int(cur.lastrowid)
 
     async def get_case(self, case_id: int) -> Optional[dict]:
         row = await self.db.fetchone("SELECT * FROM cases WHERE id=?", (case_id,))
@@ -327,29 +341,28 @@ class CaseRepo:
         note: str | None = None,
     ) -> int:
         now = utc_now_iso()
-        cur = await self.db.execute(
+        return await self.db.insert_and_get_id(
             """
             INSERT INTO evidence(case_id, provider_id, type, label, url, content_type, size, note, created_at)
             VALUES(?,?,?,?,?,?,?,?,?)
             """,
             (case_id, provider_id, ev_type, label, url, content_type, size, note, now),
         )
-        return int(cur.lastrowid)
 
     async def set_review_message(self, case_id: int, channel_id: int, message_id: int) -> None:
-        await self.db.execute(
+        await self.db.execute_close(
             "UPDATE cases SET review_channel_id=?, review_message_id=?, updated_at=? WHERE id=?",
             (channel_id, message_id, utc_now_iso(), case_id),
         )
 
     async def set_status(self, case_id: int, status: str, reason: str | None = None) -> None:
-        await self.db.execute(
+        await self.db.execute_close(
             "UPDATE cases SET status=?, status_reason=?, updated_at=? WHERE id=?",
             (status, reason, utc_now_iso(), case_id),
         )
 
     async def approve_case(self, case_id: int, approved_visibility: str) -> None:
-        await self.db.execute(
+        await self.db.execute_close(
             "UPDATE cases SET status=?, approved_visibility=?, updated_at=? WHERE id=?",
             ("in_session", approved_visibility, utc_now_iso(), case_id),
         )
@@ -361,7 +374,7 @@ class CaseRepo:
         court_channel_id: int | None,
         court_thread_id: int | None,
     ) -> None:
-        await self.db.execute(
+        await self.db.execute_close(
             """
             UPDATE cases
             SET court_channel_id=?, court_thread_id=?, updated_at=?
@@ -371,14 +384,14 @@ class CaseRepo:
         )
 
     async def set_court_panel_message(self, case_id: int, message_id: int) -> None:
-        await self.db.execute(
+        await self.db.execute_close(
             "UPDATE cases SET court_panel_message_id=?, updated_at=? WHERE id=?",
             (message_id, utc_now_iso(), case_id),
         )
 
 
     async def clear_court_space(self, case_id: int) -> None:
-        await self.db.execute(
+        await self.db.execute_close(
             "UPDATE cases SET court_channel_id=NULL, court_thread_id=NULL, court_panel_message_id=NULL, updated_at=? WHERE id=?",
             (utc_now_iso(), case_id),
         )
@@ -394,14 +407,13 @@ class CaseRepo:
         message_id: int | None,
     ) -> int:
         now = utc_now_iso()
-        cur = await self.db.execute(
+        return await self.db.insert_and_get_id(
             """
             INSERT INTO statements(case_id, round, side, content, submitted_by, message_id, created_at)
             VALUES(?,?,?,?,?,?,?)
             """,
             (case_id, round_number, side, content, submitted_by, message_id, now),
         )
-        return int(cur.lastrowid)
 
     async def advance_turn(self, case_id: int) -> dict:
         case = await self.get_case(case_id)
@@ -418,13 +430,13 @@ class CaseRepo:
         else:
             next_round = current_round + 1
             next_side = "complainant"
-            # 第 3 轮（及之后）结束后暂停，让双方决定是否继续辩诉
+            # 第 3 轮（及之后）结束后暂停，让双方决定是否继续议诉
             if current_round >= 3:
                 next_status = "awaiting_continue"
             else:
                 next_status = "in_session"
 
-        await self.db.execute(
+        await self.db.execute_close(
             """
             UPDATE cases
             SET status=?, current_round=?, current_side=?, updated_at=?
@@ -438,7 +450,7 @@ class CaseRepo:
         return updated
 
     async def set_judge_panel_message(self, case_id: int, channel_id: int, message_id: int) -> None:
-        await self.db.execute(
+        await self.db.execute_close(
             "UPDATE cases SET judge_panel_channel_id=?, judge_panel_message_id=?, updated_at=? WHERE id=?",
             (channel_id, message_id, utc_now_iso(), case_id),
         )
@@ -453,14 +465,13 @@ class CaseRepo:
         published_message_id: int | None,
     ) -> int:
         now = utc_now_iso()
-        cur = await self.db.execute(
+        return await self.db.insert_and_get_id(
             """
             INSERT INTO judgements(case_id, decision, penalty, operator_id, published_message_id, created_at)
             VALUES(?,?,?,?,?,?)
             """,
             (case_id, decision, penalty, operator_id, published_message_id, now),
         )
-        return int(cur.lastrowid)
 
 
     async def get_latest_judgement(self, case_id: int) -> Optional[dict]:
@@ -473,7 +484,7 @@ class CaseRepo:
     async def log(self, case_id: int, action: str, operator_id: int | None, meta: dict | None = None) -> None:
         now = utc_now_iso()
         meta_json = json.dumps(meta, ensure_ascii=False) if meta else None
-        await self.db.execute(
+        await self.db.execute_close(
             """
             INSERT INTO case_logs(case_id, action, operator_id, meta_json, created_at)
             VALUES(?,?,?,?,?)
@@ -509,7 +520,7 @@ class CaseRepo:
         )
         return [dict(r) for r in rows]
 
-    # -------------------- 继续/结束辩诉（双方同意机制） --------------------
+    # -------------------- 继续/结束议诉（双方同意机制） --------------------
 
     async def get_continue_state(self, case_id: int) -> Optional[dict]:
         row = await self.db.fetchone("SELECT * FROM continue_state WHERE case_id=?", (case_id,))
@@ -524,7 +535,7 @@ class CaseRepo:
         defendant_choice: str | None = None,
     ) -> None:
         now = utc_now_iso()
-        await self.db.execute(
+        await self.db.execute_close(
             """
             INSERT INTO continue_state(case_id, panel_message_id, complainant_choice, defendant_choice, created_at, updated_at)
             VALUES(?,?,?,?,?,?)
@@ -547,12 +558,12 @@ class CaseRepo:
 
         now = utc_now_iso()
         if side == 'complainant':
-            await self.db.execute(
+            await self.db.execute_close(
                 "UPDATE continue_state SET complainant_choice=?, updated_at=? WHERE case_id=?",
                 (choice, now, case_id),
             )
         else:
-            await self.db.execute(
+            await self.db.execute_close(
                 "UPDATE continue_state SET defendant_choice=?, updated_at=? WHERE case_id=?",
                 (choice, now, case_id),
             )
@@ -563,7 +574,7 @@ class CaseRepo:
         return updated
 
     async def clear_continue_state(self, case_id: int) -> None:
-        await self.db.execute("DELETE FROM continue_state WHERE case_id=?", (case_id,))
+        await self.db.execute_close("DELETE FROM continue_state WHERE case_id=?", (case_id,))
 
     # -------------------- 发言权窗口（turn_state） --------------------
 
@@ -582,7 +593,7 @@ class CaseRepo:
         msg_limit: int = 10,
     ) -> None:
         now = utc_now_iso()
-        await self.db.execute(
+        await self.db.execute_close(
             """
             INSERT INTO turn_state(case_id, channel_id, speaker_id, expires_at, msg_count, msg_limit, created_at, updated_at)
             VALUES(?,?,?,?,?,?,?,?)
@@ -598,7 +609,7 @@ class CaseRepo:
         )
 
     async def increment_turn_msg_count(self, case_id: int, *, delta: int = 1) -> Optional[int]:
-        await self.db.execute(
+        await self.db.execute_close(
             "UPDATE turn_state SET msg_count = msg_count + ?, updated_at=? WHERE case_id=?",
             (delta, utc_now_iso(), case_id),
         )
@@ -606,13 +617,13 @@ class CaseRepo:
         return int(st["msg_count"]) if st else None
 
     async def set_turn_msg_count(self, case_id: int, *, msg_count: int) -> None:
-        await self.db.execute(
+        await self.db.execute_close(
             "UPDATE turn_state SET msg_count=?, updated_at=? WHERE case_id=?",
             (msg_count, utc_now_iso(), case_id),
         )
 
     async def clear_turn_state(self, case_id: int) -> None:
-        await self.db.execute("DELETE FROM turn_state WHERE case_id=?", (case_id,))
+        await self.db.execute_close("DELETE FROM turn_state WHERE case_id=?", (case_id,))
 
     async def list_expired_turn_states(self, *, now_iso: str | None = None) -> list[dict]:
         now = now_iso or utc_now_iso()
@@ -628,7 +639,7 @@ class GuildSettingsRepo:
     """服务器级配置。
 
     用于避免把频道/分类/Forum 等写死在 .env 里。
-    管理员可通过 `/类脑大法庭 设置` 在服务器内完成配置，存入 SQLite。
+    管理员可通过 `/议诉 设置` 在服务器内完成配置，存入 SQLite。
     """
 
     def __init__(self, db: Database):
@@ -662,7 +673,7 @@ class GuildSettingsRepo:
         now = utc_now_iso()
         admin_role_ids_json = json.dumps(sorted(set(admin_role_ids)), ensure_ascii=False)
 
-        await self.db.execute(
+        await self.db.execute_close(
             """
             INSERT INTO guild_settings(
               guild_id,

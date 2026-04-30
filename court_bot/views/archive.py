@@ -37,4 +37,4 @@ class ArchiveView(discord.ui.View):
             await interaction.edit_original_response(content=f"归档失败：{e}")
             return
 
-        await interaction.edit_original_response(content="已归档并删除该案件频道。")
+        await interaction.edit_original_response(content="已归档并删除该议诉频道。")

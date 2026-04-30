@@ -84,11 +84,11 @@ class JudgementView(discord.ui.View):
 
         case = await self.bot.repo.get_case(self.case_id)
         if not case:
-            await interaction.edit_original_response(content="案件不存在。")
+            await interaction.edit_original_response(content="未找到该议诉。")
             return
 
         if case.get("status") != STATUS_AWAITING_JUDGEMENT:
-            await interaction.edit_original_response(content="该案件当前不在待裁决状态。")
+            await interaction.edit_original_response(content="该议诉当前不在待裁决状态。")
             return
 
         await interaction.edit_original_response(content="正在发布裁决...")
@@ -117,8 +117,9 @@ class JudgementView(discord.ui.View):
 
         await self.bot.repo.set_status(self.case_id, STATUS_CLOSED, f"{decision}｜{penalty}")
         await self.bot.repo.log(self.case_id, "judgement_published", interaction.user.id, {"decision": decision, "penalty": penalty})
+        self.bot.forget_case_runtime_state(self.case_id)
 
-        # 刷新案件帖/频道内的“庭审控制面板”，让结果也体现在案件空间里
+        # 刷新议诉帖/频道内的“议诉控制面板”，让结果也体现在议诉频道里
         updated_case = await self.bot.repo.get_case(self.case_id)
         if updated_case:
             await self.bot.refresh_court_panel(updated_case)
@@ -127,7 +128,7 @@ class JudgementView(discord.ui.View):
         # 如果是 Forum 帖子线程，结案后自动锁定/归档（不影响阅读，但避免后续干扰）
         if isinstance(space, discord.Thread):
             try:
-                await space.edit(archived=True, locked=True, reason=f"案件 #{self.case_id} 已结案")
+                await space.edit(archived=True, locked=True, reason=f"议诉 #{self.case_id} 已结案")
             except Exception:
                 pass
 
@@ -135,7 +136,7 @@ class JudgementView(discord.ui.View):
             bot=self.bot,
             audit_channel_id=settings.get("audit_log_channel_id") if settings else None,
             title="裁决发布",
-            description=f"案件 #{self.case_id} 已发布裁决：{decision}｜{penalty}\n说明：{reason}",
+            description=f"议诉 #{self.case_id} 已发布裁决：{decision}｜{penalty}\n说明：{reason}",
             case_id=self.case_id,
             operator=interaction.user,
         )

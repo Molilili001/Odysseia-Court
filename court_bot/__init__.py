@@ -1,1 +1,1 @@
-"""Discord 类脑大法庭 Bot 包。"""
+"""Discord 议诉系统 Bot 包。"""

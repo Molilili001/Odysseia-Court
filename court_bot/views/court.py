@@ -18,7 +18,7 @@ from .modals import WithdrawCaseModal
 
 
 class CourtView(discord.ui.View):
-    """庭审控制面板（案件频道内）。
+    """议诉控制面板（议诉频道内）。
 
     自主发言模式：
     - 双方默认禁言
@@ -75,11 +75,11 @@ class CourtView(discord.ui.View):
 
         case = await self.bot.repo.get_case(self.case_id)
         if not case:
-            await interaction.response.send_message("案件不存在。", ephemeral=True)
+            await interaction.response.send_message("未找到该议诉。", ephemeral=True)
             return
 
         if case.get("status") != STATUS_IN_SESSION:
-            await interaction.response.send_message("当前案件不在庭审中。", ephemeral=True)
+            await interaction.response.send_message("当前议诉不在进行中。", ephemeral=True)
             return
 
         current_side = case.get("current_side") or SIDE_COMPLAINANT
@@ -137,11 +137,11 @@ class CourtView(discord.ui.View):
 
         case = await self.bot.repo.get_case(self.case_id)
         if not case:
-            await interaction.response.send_message("案件不存在。", ephemeral=True)
+            await interaction.response.send_message("未找到该议诉。", ephemeral=True)
             return
 
         if case.get("status") != STATUS_IN_SESSION:
-            await interaction.response.send_message("当前案件不在庭审中。", ephemeral=True)
+            await interaction.response.send_message("当前议诉不在进行中。", ephemeral=True)
             return
 
         st = await self.bot.repo.get_turn_state(self.case_id)
@@ -175,7 +175,7 @@ class CourtView(discord.ui.View):
             bot=self.bot,
             audit_channel_id=settings.get("audit_log_channel_id") if settings else None,
             title="结束本轮发言",
-            description=f"案件 #{self.case_id} 已结束本轮发言。",
+            description=f"议诉 #{self.case_id} 已结束本轮发言。",
             case_id=self.case_id,
             operator=interaction.user,
         )
@@ -209,9 +209,9 @@ class CourtView(discord.ui.View):
                     space = await self.bot.get_case_space(updated_case)
                     if space is not None:
                         if updated_case.get("status") == STATUS_AWAITING_CONTINUE:
-                            await space.send("【系统】管理已强制推进回合，进入‘是否继续辩诉’投票阶段。")
+                            await space.send("【系统】管理已强制推进回合，进入‘是否继续议诉’投票阶段。")
                         elif updated_case.get("status") == STATUS_AWAITING_JUDGEMENT:
-                            await space.send("【系统】管理已强制推进并结束辩诉，进入裁决。")
+                            await space.send("【系统】管理已强制推进并结束议诉，进入裁决。")
                         else:
                             next_side = updated_case.get("current_side") or SIDE_COMPLAINANT
                             next_expected_id = (

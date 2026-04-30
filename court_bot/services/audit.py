@@ -31,7 +31,7 @@ async def send_audit_log(
 
     embed = discord.Embed(title=title, description=description, color=COLOR_GRAY)
     if case_id is not None:
-        embed.add_field(name="案件", value=f"#{case_id}", inline=True)
+        embed.add_field(name="议诉", value=f"#{case_id}", inline=True)
     if operator is not None:
         embed.add_field(name="操作者", value=f"{operator} ({operator.id})", inline=False)
 

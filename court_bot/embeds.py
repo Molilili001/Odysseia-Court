@@ -51,8 +51,8 @@ def status_label(status: str) -> str:
         STATUS_UNDER_REVIEW: "待审核",
         STATUS_NEEDS_MORE_EVIDENCE: "待补充材料",
         STATUS_REJECTED: "已驳回",
-        STATUS_IN_SESSION: "庭审中",
-        STATUS_AWAITING_CONTINUE: "待决定是否继续辩诉",
+        STATUS_IN_SESSION: "议诉中",
+        STATUS_AWAITING_CONTINUE: "待决定是否继续议诉",
         STATUS_AWAITING_JUDGEMENT: "待裁决",
         STATUS_CLOSED: "已结案",
         STATUS_WITHDRAWN: "已撤诉",
@@ -60,10 +60,10 @@ def status_label(status: str) -> str:
 
 
 def build_case_review_embed(case: dict, evidences: Iterable[dict]) -> discord.Embed:
-    """管理审核频道使用的案件卡片。"""
+    """管理审核频道使用的议诉卡片。"""
 
     embed = discord.Embed(
-        title=f"类脑大法庭｜案件 #{case['id']}（{status_label(case['status'])}）",
+        title=f"议诉 #{case['id']}（{status_label(case['status'])}）",
         color=COLOR_YELLOW,
     )
 
@@ -81,21 +81,21 @@ def build_case_review_embed(case: dict, evidences: Iterable[dict]) -> discord.Em
     )
 
     embed.add_field(
-        name="申请开庭模式",
+        name="申请议诉模式",
         value=visibility_label(case.get("requested_visibility") or ""),
         inline=True,
     )
     if case.get("approved_visibility"):
         embed.add_field(
-            name="最终开庭模式",
+            name="最终议诉模式",
             value=visibility_label(case.get("approved_visibility") or ""),
             inline=True,
         )
 
-    # 若已创建案件空间，则提供链接指路
+    # 若已创建议诉频道，则提供链接指路
     space_id = case.get("court_thread_id") or case.get("court_channel_id")
     if space_id:
-        embed.add_field(name="庭审地址", value=f"<#{int(space_id)}> ", inline=False)
+        embed.add_field(name="议诉频道", value=f"<#{int(space_id)}> ", inline=False)
 
     embed.add_field(
         name="违反规则",
@@ -104,25 +104,44 @@ def build_case_review_embed(case: dict, evidences: Iterable[dict]) -> discord.Em
     )
 
     desc = case.get("description", "")
-    embed.add_field(name="案件说明", value=_truncate(desc, 1024) or "（空）", inline=False)
+    embed.add_field(name="申请说明", value=_truncate(desc, 1024) or "（空）", inline=False)
 
     # 证据
     lines: list[str] = []
     for ev in evidences:
         ev_type = ev.get("type")
-        label = ev.get("label") or "证据"
-        url = ev.get("url")
-        if ev_type == "attachment" and url:
-            lines.append(f"- 📎 **{label}**：{url}")
-        elif ev_type == "link" and url:
-            lines.append(f"- 🔗 **{label}**：{url}")
-        elif url:
-            lines.append(f"- **{label}**：{url}")
+        label = (ev.get("label") or "证据").strip()
+        url = (ev.get("url") or "").strip()
+        note = (ev.get("note") or "").strip()
+        provider_id = ev.get("provider_id")
+
+        if ev_type == "attachment":
+            icon = "📎"
+        elif ev_type == "link":
+            icon = "🔗"
         else:
-            lines.append(f"- **{label}**")
+            icon = "🧾"
+
+        if ev_type == "attachment" and url:
+            main = f"{icon} **{label}**：{url}"
+        elif ev_type == "link" and url:
+            main = f"{icon} **{label}**：{url}"
+        elif url:
+            main = f"{icon} **{label}**：{url}"
+        else:
+            main = f"{icon} **{label}**"
+
+        extras: list[str] = []
+        if provider_id:
+            extras.append(f"提供者：<@{int(provider_id)}>")
+        if note:
+            extras.append(f"说明：{note}")
+        if extras:
+            main += "（" + "；".join(extras) + "）"
+        lines.append(f"- {main}")
 
     evidence_text = "\n".join(lines) if lines else "（无）"
-    embed.add_field(name="初始证据", value=_truncate(evidence_text, 1024), inline=False)
+    embed.add_field(name="证据（链接/附件）", value=_truncate(evidence_text, 1024), inline=False)
 
     if case.get("status_reason"):
         embed.add_field(name="备注/原因", value=_truncate(case["status_reason"], 1024), inline=False)
@@ -131,17 +150,17 @@ def build_case_review_embed(case: dict, evidences: Iterable[dict]) -> discord.Em
 
 
 def build_opening_post_embed(case: dict, evidences: Iterable[dict]) -> discord.Embed:
-    """案件空间（频道/帖子）首楼：案情 + 初始证据。"""
+    """议诉频道首楼：申请说明 + 初始证据。"""
 
     embed = discord.Embed(
-        title=f"📌 案件 #{case['id']}｜案情与证据",
+        title=f"📌 议诉 #{case['id']}｜申请说明与证据",
         color=COLOR_YELLOW,
     )
 
     embed.add_field(name="投诉人", value=f"<@{case['complainant_id']}>", inline=True)
     embed.add_field(name="被投诉人", value=f"<@{case['defendant_id']}>", inline=True)
     embed.add_field(
-        name="开庭模式",
+        name="议诉模式",
         value=visibility_label(case.get("approved_visibility") or case.get("requested_visibility") or ""),
         inline=True,
     )
@@ -153,7 +172,7 @@ def build_opening_post_embed(case: dict, evidences: Iterable[dict]) -> discord.E
     )
 
     desc = (case.get("description") or "").strip()
-    embed.add_field(name="案件说明", value=_truncate(desc, 1024) or "（空）", inline=False)
+    embed.add_field(name="申请说明", value=_truncate(desc, 1024) or "（空）", inline=False)
 
     # 证据
     lines: list[str] = []
@@ -185,7 +204,7 @@ def build_opening_post_embed(case: dict, evidences: Iterable[dict]) -> discord.E
     embed.add_field(name="证据（链接/附件）", value=_truncate(evidence_text, 1024), inline=False)
 
     embed.add_field(
-        name="庭审说明",
+        name="流程说明",
         value=(
             f"三轮回合制；双方默认禁言。轮到你时点击『获取本轮发言权』，"
             f"在 {TURN_SPEAK_MINUTES} 分钟内最多发送 {TURN_MESSAGE_LIMIT} 条消息（可含图片/文件）。"
@@ -201,13 +220,13 @@ def build_court_panel_embed(case: dict) -> discord.Embed:
     color = COLOR_ORANGE if case.get("status") == STATUS_IN_SESSION else COLOR_GRAY
 
     embed = discord.Embed(
-        title=f"案件 #{case['id']}｜庭审控制面板",
+        title=f"议诉 #{case['id']}｜议诉控制面板",
         color=color,
     )
 
     embed.add_field(name="状态", value=status_label(case.get("status", "")), inline=True)
     embed.add_field(
-        name="开庭模式",
+        name="议诉模式",
         value=visibility_label(case.get("approved_visibility") or case.get("requested_visibility") or ""),
         inline=True,
     )
@@ -276,7 +295,7 @@ def build_statement_embed(
         badge = "⬜"
 
     embed = discord.Embed(
-        title=f"案件 #{case_id}｜{badge}{who}｜第 {round_number} 轮（{round_label(round_number)}）",
+        title=f"议诉 #{case_id}｜{badge}{who}｜第 {round_number} 轮（{round_label(round_number)}）",
         description=(
             ("**陈述内容：**\n\n" + _truncate((content or "").strip(), 3800)).strip()
             or "（空）"
@@ -308,7 +327,7 @@ def build_judgement_result_embed(case: dict, decision: str, penalty: str, reason
         color = COLOR_GRAY
 
     embed = discord.Embed(
-        title=f"⚖️ 案件 #{case['id']}｜裁决结果",
+        title=f"⚖️ 议诉 #{case['id']}｜裁决结果",
         description=f"**裁决：{decision}**",
         color=color,
     )
@@ -321,10 +340,10 @@ def build_judgement_result_embed(case: dict, decision: str, penalty: str, reason
 
 
 def build_continue_panel_embed(case: dict, state: dict | None) -> discord.Embed:
-    """三辩结束后，双方决定是否继续辩诉的面板。"""
+    """三辩结束后，双方决定是否继续议诉的面板。"""
 
     embed = discord.Embed(
-        title=f"案件 #{case['id']}｜是否继续辩诉？",
+        title=f"议诉 #{case['id']}｜是否继续议诉？",
         color=COLOR_YELLOW,
     )
 
@@ -337,7 +356,7 @@ def build_continue_panel_embed(case: dict, state: dict | None) -> discord.Embed:
     else:
         next_who = "（未知）"
 
-    embed.description = "双方都选择『希望继续辩诉』才会进入下一轮；任意一方选择『希望结束辩诉』将进入裁决。"
+    embed.description = "双方都选择『希望继续议诉』才会进入下一轮；任意一方选择『希望结束议诉』将进入裁决。"
     embed.add_field(name="若继续", value=f"将进入第 {r} 轮（{round_label(r)}），由 {next_who} 先发言。", inline=False)
 
     def fmt(choice: str | None) -> str:

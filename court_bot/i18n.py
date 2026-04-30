@@ -11,7 +11,7 @@ class StaticExtrasTranslator(app_commands.Translator):
     """一个“静态字典翻译器”。
 
     用法：把需要本地化的字段写成 locale_str：
-        locale_str('apply', zh_CN='申请开庭', zh_TW='申請開庭', en_US='申请开庭')
+        locale_str('apply', zh_CN='申请议诉', zh_TW='申請議訴', en_US='申请议诉')
 
     然后在 Bot 启动时：
         bot.tree.set_translator(StaticExtrasTranslator())
