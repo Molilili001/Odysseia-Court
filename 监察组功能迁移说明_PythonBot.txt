@@ -1,0 +1,808 @@
+监察组功能迁移说明：从 JS Bot 迁移到 Python Discord Bot
+====================================================
+
+目标：
+将当前 JS 版 The-Parliament-Bot 中已经实现的“监察组”功能迁移到另一个 Python bot 中。
+目标 Python bot 工作区：
+C:\Users\liuyuxuan\Desktop\破解区
+
+目标 bot 技术栈：
+- Python
+- discord.py >= 2.3.2
+- aiosqlite
+- Cog / app_commands 架构
+
+重要说明：
+- 不需要迁移旧数据库数据。
+- 只需要迁移功能。
+- 新 bot 中应重新创建独立数据库 data/inspection.sqlite。
+- 要求以独立模块化 Cog 的形式实现。
+- 不要把监察组业务逻辑塞进现有 court / 议诉模块。
+- 不要改 court_bot/services/db.py。
+- 不要接入 message/on_message 自动触发流程。
+- 核心接入尽量只改 court_bot/bot.py，增加一行 load_extension。
+
+
+一、推荐新增目录结构
+--------------------
+
+在目标 bot 中新增：
+
+court_bot/inspection/
+  __init__.py
+  constants.py
+  utils.py
+  database.py
+  settings_service.py
+  candidate_service.py
+  case_service.py
+  vote_service.py
+  views.py
+  cog.py
+
+原则：
+- 所有监察组业务逻辑都放在 court_bot/inspection/。
+- 不污染 court_bot/cogs/court.py。
+- 不扩展 court_bot/services/db.py。
+- 不复用议诉系统数据库。
+
+
+二、最小核心接入
+----------------
+
+目标 bot 的 court_bot/bot.py 中 setup_hook 目前有类似：
+
+await self.load_extension("court_bot.cogs.court")
+
+迁移完成后，只需要新增：
+
+await self.load_extension("court_bot.inspection.cog")
+
+除此之外尽量不改核心。
+
+
+三、数据库要求
+--------------
+
+使用独立 SQLite：
+
+data/inspection.sqlite
+
+Python 使用 aiosqlite。
+
+不要迁移旧数据，不需要复制 JS bot 的 data/inspection.sqlite。
+
+需要在 court_bot/inspection/database.py 中实现独立数据库层。
+
+建议表结构保留：
+
+1. inspection_settings
+2. inspection_candidates
+3. inspection_cases
+4. inspection_case_responses
+5. inspection_case_bans
+6. inspection_case_members
+7. inspection_votes
+8. inspection_case_archives
+
+主要设置 key：
+
+- candidate_role_id
+- admin_notice_channel_id
+- discussion_category_id
+- verdict_channel_id
+- retention_days
+- archive_channel_id（可选；不纳入核心命令严格必填）
+
+默认值：
+
+- retention_days = 30
+- CONFIRM_GRACE_DAYS = 7
+
+
+四、命令模型
+------------
+
+Python 版保持 6 个根入口：
+
+/监察 设置
+/监察 成员管理
+/监察 启动监察
+/监察 案件管理
+/监察 投票面板
+/监察 归档
+
+因为 discord.py 推荐命令内部名使用英文，建议内部命令名：
+
+/inspection
+
+通过 locale_str 显示为中文：
+
+name=locale_str("inspection", zh_CN="监察", zh_TW="監察")
+
+也就是说，中文客户端看到的是 /监察。
+
+
+五、权限规则
+------------
+
+监察模块独立判断 Admin，不依赖议诉系统的 admin_role 设置。
+
+规则：
+- 服务器 owner；或
+- 具备 Administrator 权限。
+
+建议函数：
+
+is_server_admin(member) -> bool
+
+逻辑：
+
+return member.guild.owner_id == member.id or member.guild_permissions.administrator
+
+
+六、/监察 设置
+---------------
+
+用途：查看或更新监察模块设置。
+
+参数均为可选：
+
+- 监察候补身份组：Role
+- admin通知频道：TextChannel 或 AnnouncementChannel
+- 临时讨论频道分类：CategoryChannel
+- 裁决公示频道：TextChannel 或 AnnouncementChannel
+- 留任确认周期天数：int，可选，默认 30
+- 归档频道：TextChannel，可选；不影响核心监察命令启用，归档时未配置则回退 admin 通知频道
+
+行为：
+- 只有 Admin 可用。
+- 如果有参数，更新对应设置。
+- 如果没有参数，展示当前设置。
+
+
+七、/监察 成员管理
+------------------
+
+这是一个压缩后的单入口命令。
+
+形式：
+
+/监察 成员管理 操作:... 用户:@user 原因:...
+
+参数：
+
+- 操作：必填 Choice
+- 用户：可选
+- 原因：可选
+
+操作 choices：
+
+- 添加候补 -> 添加
+- 移除候补 -> 移除
+- 主动退出 -> 退出
+- 查看名单 -> 名单
+- 设置留任 -> 设置留任
+
+
+7.1 添加候补
+~~~~~~~~~~~~
+
+命令：
+
+/监察 成员管理 操作:添加候补 用户:@user
+
+要求：Admin。
+
+行为：
+- 给用户添加监察候补身份组。
+- 写入 inspection_candidates。
+- status = active。
+- 设置下次留任确认时间。
+
+
+7.2 移除候补
+~~~~~~~~~~~~
+
+命令：
+
+/监察 成员管理 操作:移除候补 用户:@user 原因:...
+
+要求：Admin。
+
+行为：
+- 移除监察候补身份组。
+- 候补记录改为 removed。
+- 保存原因。
+
+
+7.3 主动退出
+~~~~~~~~~~~~
+
+命令：
+
+/监察 成员管理 操作:主动退出
+
+要求：候补本人可用，不需要 Admin。
+
+行为：
+- 移除自己的监察候补身份组。
+- 候补记录 status = self_exit。
+
+
+7.4 查看名单
+~~~~~~~~~~~~
+
+命令：
+
+/监察 成员管理 操作:查看名单
+
+当前 JS 版是 Admin-only，Python 版也先按 Admin-only 实现。
+
+显示：
+- 用户 mention
+- status
+- 下次确认时间
+- 确认截止时间
+- 移除原因
+
+
+7.5 设置留任
+~~~~~~~~~~~~
+
+命令：
+
+/监察 成员管理 操作:设置留任 用户:@user
+
+要求：Admin。
+
+行为：
+- 如果用户没有候补身份组，补上。
+- 如果没有候补 DB 记录，则创建 active 记录。
+- 如果已有记录，则确认留任。
+- 重置下次确认时间。
+
+
+八、候补留任确认
+----------------
+
+需要后台任务，默认每 1 小时检查一次。
+
+逻辑：
+
+1. 找到 next_confirm_at <= now 的 active 候补。
+2. 给候补发 DM，询问是否继续留任。
+3. DM 中有两个按钮：
+
+   insp_candidate_keep_<sessionId>
+   insp_candidate_exit_<sessionId>
+
+4. 如果 DM 成功：
+   - 记录 confirm_session_id。
+   - 记录 confirm_deadline_at = now + 7 days。
+   - status 仍为 active。
+
+5. 如果 DM 失败：
+   - 记录 confirm_session_id。
+   - 记录 confirm_deadline_at = now + 7 days。
+   - status = confirm_dm_failed。
+   - 通知 admin 频道。
+
+6. 7 天内 Admin 可以使用：
+
+   /监察 成员管理 操作:设置留任 用户:@user
+
+   手动处理。
+
+7. 如果到期仍未处理：
+   - 自动移除候补身份组。
+   - 候补记录 status = removed。
+   - 原因：留任确认超时未处理。
+   - 通知 admin 频道。
+
+
+九、/监察 启动监察
+------------------
+
+要求：Admin。
+
+命令参数：
+
+- 案件说明：str，必填
+- 投诉方说明：str，必填
+- 被投诉方说明：str，必填
+- 响应期限小时：int，必填，>=1
+- ban阶段期限小时：int，必填，>=1
+- 材料链接：str，可选
+
+行为：
+
+1. 创建监察案件。
+2. 案件状态为 collecting_responses。
+3. 从 active / confirm_dm_failed 候补里筛选当前服务器仍存在且仍拥有候补身份组的成员。
+4. 给候补发 DM，询问是否愿意参与本案。
+5. DM 按钮：
+
+   insp_case_accept_<caseId>
+   insp_case_decline_<caseId>
+
+6. 响应记录写入 inspection_case_responses。
+7. 初始响应状态为 invited。
+8. 如果 DM 失败，响应状态为 dm_failed。
+9. 到响应截止时间，或者所有可响应者都响应后，推进案件。
+
+
+十、响应阶段结束逻辑
+--------------------
+
+响应状态：
+
+- invited
+- willing
+- declined
+- dm_failed
+- selected
+- not_selected
+- banned
+
+响应阶段结束后：
+
+如果愿意人数 < 3：
+- 案件状态 blocked_insufficient_responses。
+- 通知 admin：愿意参与人数不足，无法抽取临时监察组。
+
+如果愿意人数 >= 3：
+- 进入 Ban 阶段，案件状态 ban_pending。
+
+Ban 规则：
+
+- 愿意人数 >= 8：每方 2 个 Ban 位，Ban 后至少保留 4 人。
+- 愿意人数 >= 5：每方 1 个 Ban 位，Ban 后至少保留 3 人。
+- 愿意人数 3-4：无 Ban 位，直接抽取。
+
+如果无 Ban 位：
+- 通知 admin。
+- 直接无 Ban 抽取。
+
+
+十一、/监察 案件管理
+--------------------
+
+这是一个压缩后的单入口命令。
+
+形式：
+
+/监察 案件管理 操作:... 案件id:...
+
+参数：
+
+- 操作：必填 Choice
+- 案件id：必填
+- 投诉方ban1：User，可选
+- 投诉方ban2：User，可选
+- 被投诉方ban1：User，可选
+- 被投诉方ban2：User，可选
+- 替换用户：User，可选
+- 原因：str，可选
+
+操作 choices：
+
+- 查看状态 -> 状态
+- Ban并抽取 -> ban并抽取
+- 无Ban抽取 -> 抽取
+- 补抽 -> 补抽
+- 取消 -> 取消
+
+当前 JS 版中整个案件管理都是 Admin-only，Python 版也先按 Admin-only 实现。
+
+
+11.1 查看状态
+~~~~~~~~~~~~~
+
+命令：
+
+/监察 案件管理 操作:查看状态 案件id:...
+
+显示：
+- 案件 ID
+- 当前状态
+- 案件说明
+- 投诉方说明
+- 被投诉方说明
+- 响应统计
+- Ban 记录
+- 临时监察组成员
+- 响应截止
+- Ban 截止
+- 投票截止
+- 裁决结果
+
+
+11.2 Ban 并抽取
+~~~~~~~~~~~~~~~
+
+命令：
+
+/监察 案件管理 操作:Ban并抽取 案件id:... 投诉方ban1:@user 投诉方ban2:@user 被投诉方ban1:@user 被投诉方ban2:@user
+
+规则：
+- 只有 ban_pending 状态可用。
+- Admin 代双方记录 Ban。
+- 同一方内部不能重复 Ban 同一个人。
+- 双方之间可以重复 Ban 同一个人。
+- 双方重复 Ban 会分别消耗名额，但只从响应池移除一次。
+- Ban 人必须在本案 willing 响应池里。
+- 不能超过当前 Ban 位。
+- Ban 后剩余人数不能低于规则要求。
+- Ban 后必须至少 3 人。
+- ban并抽取 意味着立即抽取，未使用的 Ban 位视为放弃。
+
+重要实现要求：
+- Ban 记录、候补状态变更、抽取结果、案件状态更新尽量放在事务里。
+- 如果临时频道创建失败，不应留下半更新状态。
+- 如果 DB 落库失败，应尝试删除刚创建的临时频道。
+
+
+11.3 无 Ban 抽取
+~~~~~~~~~~~~~~~~
+
+命令：
+
+/监察 案件管理 操作:无Ban抽取 案件id:...
+
+行为：
+- 不录入 Ban。
+- 直接从 willing 池随机抽取临时监察组。
+- 未使用 Ban 位视为放弃。
+
+
+十二、抽取人数规则
+------------------
+
+- 可抽取人数 >= 7：抽 7 人。
+- 可抽取人数 = 5-6：抽 5 人。
+- 可抽取人数 = 4：抽 3 人，保证最终临时监察组人数为单数。
+- 可抽取人数 = 3：抽 3 人。
+- 少于 3：blocked_insufficient_responses。
+
+最终临时监察组人数必须为单数，只会是 3 / 5 / 7；投票面板创建与投票结算也会校验该条件，避免偶数组导致平票。
+
+抽中成员写入 inspection_case_members。
+
+成员状态：selected。
+
+未抽中 willing 成员响应状态：not_selected。
+
+被 Ban 成员响应状态：banned。
+
+抽取完成后案件状态：active_discussion。
+
+
+十三、临时讨论频道
+------------------
+
+抽取完成后创建临时私密文字频道。
+
+频道分类来自设置：discussion_category_id。
+
+权限：
+- everyone：不可见。
+- Bot：可见、可发言、可读历史、管理频道。
+- 临时监察成员：可见、可发言、可读历史。
+
+频道内发送案件说明：
+- 案件 ID
+- 案件说明
+- 投诉方说明
+- 被投诉方说明
+- 材料链接
+- 临时监察成员列表
+- 提示可用 /监察 投票面板
+
+
+十四、补抽
+----------
+
+命令：
+
+/监察 案件管理 操作:补抽 案件id:... 替换用户:@user 原因:...
+
+规则：
+- 只允许 active_discussion 阶段。
+- 投票开始后不允许补抽。
+- 被替换用户必须是当前 selected 成员。
+- 从 willing 且未 selected / not replaced 的池子里补抽。
+- 原 selected 成员状态改为 replaced。
+- 新成员加入 inspection_case_members，状态 selected。
+- 更新临时频道权限：
+  - 被替换用户失去可见权限。
+  - 新成员获得可见、发言、读历史权限。
+- 在临时频道公告补抽结果。
+
+
+十五、取消案件
+--------------
+
+命令：
+
+/监察 案件管理 操作:取消 案件id:... 原因:...
+
+规则：
+- 如果还没有创建临时频道，只通知 admin 频道。
+- 如果已经有临时频道，也要在临时频道发布取消通知。
+- 案件状态 cancelled。
+- 写入 closed_at。
+
+
+十六、Ban 超时调度
+------------------
+
+后台每 1 分钟检查：
+
+status = ban_pending
+ban_deadline_at <= now
+
+规则：
+- 如果没有任何 Ban 记录：
+  1. 先通知 admin：Ban 阶段超时且没有录入 Ban，将自动无 Ban 抽取。
+  2. 然后自动无 Ban 抽取。
+- 不要重复发送 no-ban 通知。
+- 如果有 Ban 记录但还停在 ban_pending，说明可能人工流程卡住，通知 admin 关注。
+
+
+十七、/监察 投票面板
+--------------------
+
+命令：
+
+/监察 投票面板 投票时限小时:int 案件id:str?
+
+参数：
+- 投票时限小时：必填，>=1
+- 案件id：可选
+
+规则：
+- 如果不填案件id，则通过当前频道反查正在讨论或投票中的案件。
+- 只能在本案临时讨论频道内召唤。
+- 只有 Admin 或本案 selected 临时监察成员可以召唤。
+- 只有 active_discussion 状态可以召唤。
+- 当前临时监察成员少于 3 人时不允许开始投票。
+- 创建投票面板后案件状态 voting。
+- 写入 vote_panel_message_id 和 vote_deadline_at。
+
+按钮：
+
+insp_vote_yes_<caseId>
+insp_vote_no_<caseId>
+
+按钮显示：
+
+- 诉求合理
+- 诉求不合理
+
+
+十八、投票规则
+--------------
+
+- 只有本案 selected 成员可以投票。
+- 投票匿名：公开消息不会显示“谁投了什么”。
+- 用户可以在截止前再次点击按钮改票。
+- 投票过程中，每个投票者只会收到自己的 ephemeral 私密确认提示。
+- 投票过程中，频道内不会公开显示谁已投票/谁未投票。
+- 投票过程中，频道内不会实时公开当前 yes/no 票数。
+- Bot 结算/公示只显示 yes/no/未投票统计，不显示投票人身份。
+
+计票：
+
+- yes > no：诉求合理
+- no > yes：诉求不合理
+- yes == no：未形成多数
+
+投票结束条件：
+
+1. 所有 selected 成员都已投票；或
+2. 投票截止时间到。
+
+结束后：
+- 案件状态 verdict_published。
+- 写入 verdict 和 closed_at。
+- 公示内容发送到 verdict_channel_id，如果已设置。
+- 同时在临时频道发送简短结束通知。
+- 不自动删除临时讨论频道；当前留档优先。
+
+如果平票：
+- 裁决：未形成多数。
+- 通知 admin 频道：投票平票，未形成多数，请 Admin 人工关注。
+
+实现注意：
+- 投票结算要防并发，避免多个按钮同时触发导致重复公示。
+- 可以用 DB 条件更新：只允许 voting -> verdict_published 一次。
+
+
+十九、/监察 归档
+----------------
+
+命令：
+
+/监察 归档 案件id:int 处理方式:Choice? 归档频道:TextChannel?
+
+要求：Admin（服务器 owner 或 Administrator）。
+
+允许归档状态：
+- verdict_published（已公示裁决）
+- cancelled（已取消）
+
+不允许对 collecting_responses / ban_pending / active_discussion / voting 等进行中案件做正式归档，避免导出不完整流程。
+
+处理方式 choices：
+- 仅归档（默认）：导出 HTML/ZIP，原临时讨论频道继续保留。
+- 归档并锁定频道：导出 HTML/ZIP，保留原临时讨论频道，但移除本案所有临时监察组成员（含 selected / replaced）的查看权限；频道仅服务器 Admin / 具备其他管理覆盖的成员可见。
+- 归档并删除频道：导出 HTML/ZIP 并发送到归档频道成功后，删除原临时讨论频道。
+
+归档频道选择：
+1. 如果命令参数指定了归档频道，使用该频道。
+2. 否则使用 /监察 设置 中的 archive_channel_id。
+3. 如果未配置 archive_channel_id，则回退到 admin_notice_channel_id，并在返回消息/归档 embed 中提示。
+
+导出文件：
+- 复用通用 HTML/ZIP 导出器 court_bot/services/archive_export.py。
+- HTML 标题为“监察归档”。
+- 文件名形如 inspection-0001-archive.html 或 inspection-0001-archive.zip。
+- 图片附件在大小/预算允许时离线保存；非图片附件只记录 URL。
+- 如果单 HTML 超限会尝试 ZIP，仍超限则降级为只保留图片 URL 的 HTML。
+
+归档摘要包含：
+- 案件 ID、状态、裁决结果、创建/结案/截止时间。
+- 案件说明、投诉方说明、被投诉方说明、材料链接。
+- 响应统计、Ban 记录、临时监察成员、补抽记录。
+- 匿名投票统计：诉求合理 / 诉求不合理 / 未投票 / 当前临时监察成员人数。
+
+隐私规则：
+- 归档不导出“某 user_id 投了 yes/no”的实名映射。
+- 归档只展示匿名统计，延续投票匿名性。
+
+归档历史记录写入 inspection_case_archives，允许多次归档留痕。
+
+
+二十、后台调度任务
+------------------
+
+Python Cog 中用 discord.ext.tasks。
+
+需要两个循环：
+
+1. 留任维护循环，默认每 1 小时：
+
+process_due_candidate_confirmations()
+process_expired_candidate_confirmations()
+
+2. 案件循环，默认每 1 分钟：
+
+process_response_due_cases()
+process_ban_due_cases()
+process_voting_due_cases()
+
+Cog unload 时取消任务。
+
+
+二十一、自定义按钮路由
+--------------------
+
+可以在 court_bot/inspection/cog.py 中监听：
+
+@commands.Cog.listener("on_interaction")
+async def on_inspection_interaction(self, interaction: discord.Interaction):
+    custom_id = ...
+    if not custom_id.startswith("insp_"):
+        return
+
+需要处理：
+
+insp_candidate_keep_<sessionId>
+insp_candidate_exit_<sessionId>
+
+insp_case_accept_<caseId>
+insp_case_decline_<caseId>
+
+insp_vote_yes_<caseId>
+insp_vote_no_<caseId>
+
+这样不需要改 court_bot/bot.py 的 interaction 分发。
+
+
+二十二、状态常量
+----------------
+
+案件状态：
+
+- collecting_responses
+- ban_pending
+- blocked_insufficient_responses
+- active_discussion
+- voting
+- verdict_published
+- cancelled
+
+候补状态：
+
+- active
+- confirm_dm_failed
+- removed
+- self_exit
+
+响应状态：
+
+- invited
+- willing
+- declined
+- dm_failed
+- selected
+- not_selected
+- banned
+
+成员状态：
+
+- selected
+- replaced
+
+
+二十三、v1 不做的内容
+--------------------
+
+本次迁移不要实现以下内容：
+
+- 调阅 / 脱敏
+- 执行反馈闭环
+- 自动投诉区监听
+- message/on_message 自动触发
+- 自动管理/中层身份冲突检查
+- 与现有议诉系统深度耦合
+
+
+二十四、JS 版已修过的 bug，Python 版要避免
+------------------------------------------
+
+1. insp_ 按钮要独立接管，不要被其他按钮逻辑抢走。
+2. Ban + 抽取不能先写部分状态再创建频道，否则失败会留下半更新状态。
+3. 抽取时必须排除本次 Ban 的用户。
+4. 响应阶段、Ban 阶段、投票阶段推进都要防并发。
+5. 投票面板只能创建一次。
+6. 投票结算只能公示一次。
+7. 补抽频道权限更新要用正确 permission overwrite。
+8. 平票必须发布“未形成多数”并通知 admin。
+
+
+二十五、交付检查
+----------------
+
+在目标工作区运行：
+
+python -m compileall court_bot
+
+如果环境允许，也运行 bot 启动 smoke test。
+
+需要确认：
+
+- /监察 有 6 个入口：
+  - 设置
+  - 成员管理
+  - 启动监察
+  - 案件管理
+  - 投票面板
+  - 归档
+- data/inspection.sqlite 能自动创建。
+- 不影响原 /议诉 功能。
+- Cog 可以正常加载。
+- 后台任务正常启动和取消。
+
+
+二十六、目标总结
+----------------
+
+最终目标是：
+
+在 Python bot 中新增一个独立的 court_bot.inspection 模块，完整复刻 JS 版监察组 v1 功能，但不迁移旧数据，不污染现有 court/议诉系统。
+
+最小核心接入只有：
+
+await self.load_extension("court_bot.inspection.cog")

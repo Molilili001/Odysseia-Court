@@ -4,5 +4,9 @@ __pycache__/
 *.pyc
 data/*.db
 data/*.db-journal
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
+data/*.sqlite-shm
 .vscode/
 .idea/

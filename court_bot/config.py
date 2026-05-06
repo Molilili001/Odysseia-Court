@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -30,23 +31,47 @@ def _parse_int_env(name: str, default: int, *, minimum: int | None = None, maxim
     return value
 
 
-def _parse_int_set(value: str | None) -> set[int]:
+def _parse_int_sequence(value: str | None) -> tuple[int, ...]:
+    """Parse comma/space/semicolon separated integer IDs, preserving order and removing duplicates."""
+
     if not value:
-        return set()
-    out: set[int] = set()
-    for part in value.split(","):
-        part = part.strip()
+        return ()
+
+    out: list[int] = []
+    seen: set[int] = set()
+    for part in re.split(r"[,;，；\s]+", value.strip()):
         if not part:
             continue
-        out.add(int(part))
-    return out
+        item = int(part)
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return tuple(out)
+
+
+def _merge_command_guild_ids(*values: str | None) -> tuple[int, ...]:
+    """Merge COMMAND_GUILD_IDS and legacy COMMAND_GUILD_ID values."""
+
+    out: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        for guild_id in _parse_int_sequence(value):
+            if guild_id in seen:
+                continue
+            seen.add(guild_id)
+            out.append(guild_id)
+    return tuple(out)
 
 
 @dataclass(frozen=True)
 class Config:
     token: str
 
-    # 指令同步（开发期建议设置为你的服务器 ID）
+    # 指令同步：
+    # - command_guild_ids 支持多个服务器 ID，启动时逐个 Guild 快速同步
+    # - command_guild_id 保留为兼容旧代码/旧配置的“第一个 Guild ID”别名
+    command_guild_ids: tuple[int, ...]
     command_guild_id: Optional[int]
 
     # 数据库
@@ -66,7 +91,11 @@ def load_config() -> Config:
     if not token:
         raise RuntimeError("DISCORD_TOKEN 未设置，请在 .env 中填写")
 
-    command_guild_id = _parse_int(os.getenv("COMMAND_GUILD_ID"))
+    command_guild_ids = _merge_command_guild_ids(
+        os.getenv("COMMAND_GUILD_IDS"),
+        os.getenv("COMMAND_GUILD_ID"),
+    )
+    command_guild_id = command_guild_ids[0] if command_guild_ids else None
 
     db_path = os.getenv("DB_PATH", "data/court.db").strip() or "data/court.db"
 
@@ -77,6 +106,7 @@ def load_config() -> Config:
 
     return Config(
         token=token,
+        command_guild_ids=command_guild_ids,
         command_guild_id=command_guild_id,
         db_path=db_path,
         max_message_cache=max_message_cache,

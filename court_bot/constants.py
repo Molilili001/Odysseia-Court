@@ -45,5 +45,4 @@ def side_label(side: str) -> str:
 
 
 # 回合发言控制（自主发言模式）
-TURN_SPEAK_MINUTES = 10
 TURN_MESSAGE_LIMIT = 10

@@ -5,7 +5,7 @@ import gc
 import io
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -25,7 +25,6 @@ from .constants import (
     STATUS_UNDER_REVIEW,
     STATUS_WITHDRAWN,
     TURN_MESSAGE_LIMIT,
-    TURN_SPEAK_MINUTES,
     VIS_PRIVATE,
     VIS_PUBLIC,
     round_label,
@@ -64,7 +63,6 @@ class CourtBot(commands.Bot):
         self.settings_repo = GuildSettingsRepo(self.db)
         self._settings_cache: dict[int, dict] = {}
 
-        self._turn_timeout_task: asyncio.Task | None = None
         self._case_locks: dict[int, asyncio.Lock] = {}
         self._archive_semaphore = asyncio.Semaphore(config.archive_concurrency)
 
@@ -225,6 +223,8 @@ class CourtBot(commands.Bot):
 
         # 加载 Cog
         await self.load_extension("court_bot.cogs.court")
+        await self.load_extension("court_bot.inspection.cog")
+        await self.load_extension("court_bot.election.cog")
 
         # 启用指令本地化（让 locale_str 生效）
         # 没有 translator 的情况下，Discord 只会看到内部英文名，例如 /court show_settings
@@ -233,10 +233,6 @@ class CourtBot(commands.Bot):
         # 恢复 persistent views
         await self.restore_persistent_views()
 
-        # 启动“发言回合超时”扫描任务（10 分钟窗口）
-        if self._turn_timeout_task is None:
-            self._turn_timeout_task = asyncio.create_task(self._turn_timeout_loop())
-
         # 同步指令
         #
         # Discord 的应用指令分为两类：
@@ -244,20 +240,22 @@ class CourtBot(commands.Bot):
         # - Guild Commands：仅某个服务器生效，但更新几乎即时
         #
         # 为避免“服务器里出现两组指令（旧的 global + 新的 guild 或反过来）”，本项目采用：
-        # - 若设置了 COMMAND_GUILD_ID：只同步该 Guild 的命令，并把全局命令同步为空（清理旧的全局指令）
+        # - 若设置了 COMMAND_GUILD_IDS/COMMAND_GUILD_ID：只同步这些 Guild 的命令，并把全局命令同步为空（清理旧的全局指令）
         # - 否则：同步全局命令
-        if self.config.command_guild_id:
-            guild = discord.Object(id=self.config.command_guild_id)
-            try:
-                await self.tree.sync(guild=guild)
-                log.info("Synced commands to guild %s", self.config.command_guild_id)
-            except Exception:
-                log.exception("Failed to sync commands to guild %s", self.config.command_guild_id)
+        if self.config.command_guild_ids:
+            for guild_id in self.config.command_guild_ids:
+                guild = discord.Object(id=guild_id)
+                try:
+                    await self.tree.sync(guild=guild)
+                    log.info("Synced commands to guild %s", guild_id)
+                except Exception:
+                    log.exception("Failed to sync commands to guild %s", guild_id)
 
             # 清理旧的全局命令（当前模式不使用全局命令）
             try:
+                self.tree.clear_commands(guild=None)
                 await self.tree.sync()
-                log.info("Synced commands globally (purge old global commands)")
+                log.info("Cleared global commands; guild-only sync targets: %s", self.config.command_guild_ids)
             except Exception:
                 log.exception("Failed to purge global commands")
         else:
@@ -268,15 +266,6 @@ class CourtBot(commands.Bot):
                 log.exception("Failed to sync commands globally")
 
     async def close(self) -> None:
-        if self._turn_timeout_task is not None:
-            self._turn_timeout_task.cancel()
-            try:
-                await self._turn_timeout_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-
         await super().close()
         await self.db.close()
 
@@ -352,34 +341,6 @@ class CourtBot(commands.Bot):
                 await self.process_commands(message)
             except Exception:
                 pass
-
-
-    async def _turn_timeout_loop(self) -> None:
-        """后台扫描 turn_state 超时，自动结束本轮发言。
-
-        说明：
-        - 该任务在 setup_hook 启动
-        - 依赖 turn_state.expires_at（UTC ISO）
-        """
-
-        await self.wait_until_ready()
-
-        while not self.is_closed():
-            try:
-                expired = await self.repo.list_expired_turn_states()
-                for st in expired:
-                    case_id = int(st.get("case_id") or 0)
-                    if not case_id:
-                        continue
-                    try:
-                        await self.end_speaking_turn(case_id=case_id, operator=None, reason="超时自动结束")
-                    except Exception:
-                        log.exception("Failed to end expired turn (case %s)", case_id)
-            except Exception:
-                log.exception("Turn timeout loop error")
-
-            # 频率不需要太高，避免 API/DB 压力
-            await asyncio.sleep(15)
 
     # -------------------- persistent views 恢复 --------------------
 
@@ -672,7 +633,7 @@ class CourtBot(commands.Bot):
             return await self._begin_speaking_turn_impl(case_id=case_id, speaker=speaker)
 
     async def _begin_speaking_turn_impl(self, *, case_id: int, speaker: discord.Member) -> dict:
-        """授予当前应发言方本轮发言权（10 分钟/10 条）。
+        """授予当前应发言方本轮发言权（仅限制 10 条消息，不设时间限制）。
 
         - 写入 turn_state
         - 临时开启该成员的 send_messages/attach_files
@@ -699,14 +660,10 @@ class CourtBot(commands.Bot):
         if not isinstance(space, discord.TextChannel):
             raise RuntimeError("无法找到议诉频道")
 
-        expires_dt = datetime.now(timezone.utc) + timedelta(minutes=TURN_SPEAK_MINUTES)
-        expires_at = expires_dt.isoformat()
-
         await self.repo.upsert_turn_state(
             case_id=case_id,
             channel_id=space.id,
             speaker_id=speaker.id,
-            expires_at=expires_at,
             msg_count=0,
             msg_limit=TURN_MESSAGE_LIMIT,
         )
@@ -729,7 +686,6 @@ class CourtBot(commands.Bot):
             await self.repo.clear_turn_state(case_id)
             raise RuntimeError(f"设置发言权限失败：{e}")
 
-        ts = int(expires_dt.timestamp())
         who = "投诉人" if current_side == SIDE_COMPLAINANT else "被投诉人"
         r = int(case.get("current_round") or 1)
         await space.send(
@@ -737,8 +693,8 @@ class CourtBot(commands.Bot):
                 title=f"【系统】第 {r} 轮（{round_label(r)}）{who}发言开始",
                 description=(
                     f"发言者：{speaker.mention}\n"
-                    f"截止：<t:{ts}:R>\n"
-                    f"条数上限：{TURN_MESSAGE_LIMIT} 条\n\n"
+                    f"条数上限：{TURN_MESSAGE_LIMIT} 条\n"
+                    "时间限制：无\n\n"
                     "请直接在本频道发送文字/图片/文件；发完点击面板『结束本轮发言』。"
                 ),
                 color=0x5865F2,
@@ -749,7 +705,7 @@ class CourtBot(commands.Bot):
             case_id,
             "turn_started",
             speaker.id,
-            {"round": r, "side": current_side, "expires_at": expires_at, "msg_limit": TURN_MESSAGE_LIMIT},
+            {"round": r, "side": current_side, "msg_limit": TURN_MESSAGE_LIMIT},
         )
 
         return await self.repo.get_turn_state(case_id) or {}
@@ -764,7 +720,6 @@ class CourtBot(commands.Bot):
         可用于：
         - 发言者点击结束
         - 达到条数上限自动结束
-        - 超时自动结束
         - 管理强制结束
         """
 

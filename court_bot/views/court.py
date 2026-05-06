@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 import discord
 
 from ..constants import (
@@ -11,7 +9,6 @@ from ..constants import (
     STATUS_AWAITING_JUDGEMENT,
     STATUS_IN_SESSION,
     TURN_MESSAGE_LIMIT,
-    TURN_SPEAK_MINUTES,
 )
 from ..services.audit import send_audit_log
 from .modals import WithdrawCaseModal
@@ -22,8 +19,8 @@ class CourtView(discord.ui.View):
 
     自主发言模式：
     - 双方默认禁言
-    - 轮到谁，谁点击“获取本轮发言权”后才可在 10 分钟内最多发 10 条消息（可含图片/文件）
-    - 可手动结束或超时/超条数自动结束
+    - 轮到谁，谁点击“获取本轮发言权”后才可最多发 10 条消息（可含图片/文件）
+    - 可手动结束或达到条数上限自动结束
     """
 
     def __init__(self, *, bot, case_id: int, timeout: float | None = None):
@@ -91,41 +88,23 @@ class CourtView(discord.ui.View):
         st = await self.bot.repo.get_turn_state(self.case_id)
         if st:
             speaker_id = int(st.get("speaker_id") or 0)
-            expires_at = st.get("expires_at")
-            ts_text = ""
-            if expires_at:
-                try:
-                    ts = int(datetime.fromisoformat(expires_at).timestamp())
-                    ts_text = f"（截止 <t:{ts}:R>）"
-                except Exception:
-                    ts_text = ""
-
             if speaker_id == interaction.user.id:
-                await interaction.response.send_message(f"你已拥有本轮发言权{ts_text}。", ephemeral=True)
+                await interaction.response.send_message("你已拥有本轮发言权。", ephemeral=True)
             else:
-                await interaction.response.send_message(f"当前由 <@{speaker_id}> 发言{ts_text}，请稍候。", ephemeral=True)
+                await interaction.response.send_message(f"当前由 <@{speaker_id}> 发言，请稍候。", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         try:
-            st = await self.bot.begin_speaking_turn(case_id=self.case_id, speaker=interaction.user)
+            await self.bot.begin_speaking_turn(case_id=self.case_id, speaker=interaction.user)
         except Exception as e:
             await interaction.edit_original_response(content=f"无法开始本轮发言：{e}")
             return
 
-        expires_at = st.get("expires_at") if st else None
-        ts_text = ""
-        if expires_at:
-            try:
-                ts = int(datetime.fromisoformat(expires_at).timestamp())
-                ts_text = f"截止 <t:{ts}:R>"
-            except Exception:
-                ts_text = ""
-
         await interaction.edit_original_response(
             content=(
-                f"已授予你本轮发言权：{TURN_SPEAK_MINUTES} 分钟内最多 {TURN_MESSAGE_LIMIT} 条消息。{ts_text}\n"
+                f"已授予你本轮发言权：最多 {TURN_MESSAGE_LIMIT} 条消息（无时间限制）。\n"
                 "请直接在本频道发送文字/图片/文件；发完点击『结束本轮发言』。"
             )
         )

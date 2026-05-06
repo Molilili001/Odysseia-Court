@@ -1,0 +1,1836 @@
+募选系统 Cog 项目计划
+====================
+
+一、结论
+--------
+检查 C:\Users\liuyuxuan\Desktop\破解区 后，判断：
+
+在当前 Python Discord bot 中从零新增一个独立 Cog，是实现新版募选系统最安全、最清晰的方案。
+
+本计划已从原本的“实时公示统一募选”扩展为完整的“募选系统”。
+
+新版系统需要支持两种公示模式：
+
+1. 实时公示募选 realtime
+   - 用户报名成功后，立刻在公示频道为该候选人发送一条单独的 Embed 公示消息。
+   - 用户编辑、撤回、管理员打回、撤销、恢复、编辑时，都同步更新同一条候选人公示 Embed。
+
+2. 报名结束后统一公示募选 batch
+   - 报名阶段不公开候选人信息。
+   - 用户报名成功后只保存数据库，并私密提示用户。
+   - 报名结束时间到达后，Bot 自动把所有有效候选人逐个发布到公示频道。
+   - 统一公示仍然是“每个候选人一条单独的 Embed 消息”，而不是把所有候选人塞进一条大公告。
+   - 统一公示后，如果管理员编辑、撤销、打回、恢复某候选人，也更新该候选人对应的那一条 Embed。
+   - 投票开始时间到达后，Bot 自动进入投票阶段并发送统一投票器。
+   - 因此不需要单独的“发布统一公示”常规命令；统一公示是自动状态流转的一部分。
+
+两种模式只改变“候选人公示的发布时间”，不改变报名、统一投票、计票和结果生成规则。
+
+时间规则统一使用北京时间：Asia/Shanghai，UTC+8。
+管理员创建募选时，推荐使用“开始时间 + 各阶段持续时间”的方式配置，而不是分别输入每个阶段的起止时间。
+
+推荐时间配置：
+- 报名开始时间 start_at，可选；不填则默认从当前北京时间开始。
+- 报名持续时间 registration_duration，例如 3天、72小时、2天6小时。
+- 公示持续时间 publicity_duration，例如 1天、12小时、0小时。
+- 投票持续时间 voting_duration，例如 2天、48小时。
+
+Bot 根据这些持续时间自动推导：
+- registration_start_at = start_at 或 当前北京时间。
+- registration_end_at = registration_start_at + registration_duration。
+- voting_start_at = registration_end_at + publicity_duration。
+- voting_end_at = voting_start_at + voting_duration。
+
+对 batch 模式，registration_end_at 到 voting_start_at 就是统一公示期。
+对 realtime 模式，这段时间可以理解为报名结束后的候选名单整理/缓冲期，可设置为 0。
+
+建议目标：
+新增 court_bot/election/ 包，作为独立“募选系统”。
+不修改现有 court_bot/cogs/court.py、court_bot/inspection/* 的业务逻辑。
+只在 bot 启动加载处增加一个 extension：court_bot.election.cog。
+
+
+二、当前 Python bot 可复用能力
+-----------------------------
+已检查到的关键结构：
+
+1. 入口：
+   - main.py
+   - court_bot.bot.CourtBot
+
+2. Bot 生命周期：
+   - court_bot/bot.py
+   - setup_hook() 中已连接数据库、初始化 schema、加载 Cog、同步 Slash Command。
+   - 当前加载：
+     - court_bot.cogs.court
+     - court_bot.inspection.cog
+   - 新增时只需要加入：
+     - court_bot.election.cog
+
+3. 数据库：
+   - court_bot/services/db.py
+   - 使用 aiosqlite。
+   - Database 提供：
+     - connect()
+     - init_schema()
+     - execute()
+     - insert_and_get_id()
+     - execute_close()
+     - fetchone()
+     - fetchall()
+   - 适合新增独立表和独立 Repository。
+
+4. 命令模式：
+   - 使用 discord.app_commands.Group。
+   - Cog 内手动 bot.tree.add_command(group)。
+   - 支持 COMMAND_GUILD_IDS 快速同步。
+   - 建议内部命令名使用英文，中文用 locale_str 本地化显示。
+
+5. 交互组件：
+   - 已有 discord.ui.View、Button、Modal 使用示例。
+   - 可实现报名入口按钮、字段选择、分页投票、确认投票。
+
+6. 依赖：
+   - discord.py>=2.3.2,<3.0
+   - python-dotenv>=1.0.1,<2.0
+   - aiosqlite>=0.20.0,<1.0
+
+
+三、核心需求确认版
+------------------
+新版募选系统规则如下：
+
+1. 岗位/字段完全自定义。
+   管理员创建募选时输入岗位/字段名称和每个岗位/字段的当选人数。
+   示例不固定为“总管理/执行管理”，以后可以是“大当家/二当家/执行成员”等。
+   内部数据表仍使用 pe_fields / field_key 表示通用岗位字段。
+
+2. 岗位/字段有顺序。
+   最终名单按岗位/字段配置顺序依次产生。
+   例如岗位/字段配置：
+   - 大当家:1
+   - 二当家:3
+   - 执行成员:9
+
+   则先从“大当家”候选池取 1 人，再移除已当选者，从“二当家”候选池取 3 人，再移除已当选者，最后从“执行成员”候选池取 9 人。
+
+3. 报名时，每个候选人选择自己愿意进入哪些字段池。
+   例如：
+   - 只当大当家：selected_fields = [field_1]
+   - 只当执行成员：selected_fields = [field_3]
+   - 大当家和执行成员都可以：selected_fields = [field_1, field_3]
+
+4. 统一投票。
+   不再每个字段单独开投票。
+   每场募选只生成一个统一投票器。
+
+5. 投票人最多可投人数自定义。
+   例如 vote_max_selections = 14。
+
+6. 得票统计统一。
+   每个候选人在统一投票中获得一个总票数。
+
+7. 最终名单选取：
+   - 对每个字段，取 selected_fields 包含该字段的人。
+   - 排除之前字段已经当选的人。
+   - 按票数从高到低排序。
+   - 同票时，首次报名时间 registered_at 早者优先。
+   - 如果报名时间也完全相同，用 user_id 字典序兜底，保证结果稳定。
+
+8. 不补位。
+   某字段候选人数不足时，该字段空缺，不从没有选择该字段的人中补。
+
+9. 无人投票则作废。
+   如果统一投票没有任何投票记录，本次募选结果标记作废，不按 0 票和报名时间选人。
+
+10. 公示模式二选一。
+    创建时选择公示模式，创建后不能中途切换。
+    - realtime：实时公示。
+    - batch：报名结束后统一公示。
+
+11. batch 模式的自动时间规则。
+    - registration_end_at 到达后，Bot 自动发布统一公示。
+    - registration_end_at 到 voting_start_at 之间视为公示期。
+    - voting_start_at 到达后，Bot 自动进入投票阶段。
+    - 不提供单独的“发布统一公示”常规命令；管理员只保留同步/修复类命令。
+
+12. 时间配置采用北京时间和持续时间。
+    - 系统输入、显示和说明统一按北京时间 Asia/Shanghai，UTC+8。
+    - 创建时推荐输入“报名持续多久、公示持续多久、投票持续多久”。
+    - Bot 自动计算报名结束、投票开始、投票结束。
+    - 公示持续时间可为 0，表示报名结束后立即进入投票。
+
+13. 两种公示模式都使用候选人单独 Embed。
+    - 实时公示：报名成功时发该候选人的 Embed。
+    - 统一公示：报名结束后为每个有效候选人逐条发送 Embed。
+    - 每条报名记录都尽量对应一条 public_message_id。
+
+14. 公示消息不能艾特人。
+    公示内容不使用 <@user_id>、<@&role_id>、@everyone、@here。
+    发送和编辑消息时设置 allowed_mentions=discord.AllowedMentions.none()。
+
+15. 公示状态严格同步。
+    只要候选人已经被公示，不管是实时公示还是统一公示，后续报名状态变化都要同步更新同一条候选人 Embed。
+
+16. 不自动授予 Discord 身份组。
+    只收集报名、组织投票、公布结果。
+
+17. 默认权限：
+    - 管理命令：Manage Guild 或 Administrator。
+    - 报名：默认所有服务器成员可报名。
+    - 投票：初版即支持投票身份组限制。
+      管理员创建募选时可配置多个允许投票身份组。
+      用户拥有其中任意一个身份组即可投票，即 OR 规则。
+      如果未配置投票身份组，则默认所有服务器成员可投票。
+    后续可扩展报名身份组、通知身份组。
+
+
+四、模式设计
+------------
+本系统将“投票模式”和“公示模式”拆开保存。
+
+1. vote_mode
+   初版只实现：
+   - unified：统一投票。
+
+2. publicity_mode
+   初版实现：
+   - realtime：实时公示。
+   - batch：报名结束后统一公示。
+
+3. 两种模式的差异
+
+   realtime：
+   - 用户报名成功 -> 立即发送候选人 Embed 到公示频道。
+   - 用户编辑报名 -> 编辑同一条候选人 Embed。
+   - 用户撤回报名 -> 编辑同一条候选人 Embed 为“已撤回”。
+   - 管理员打回/撤销/恢复/编辑 -> 编辑同一条候选人 Embed。
+
+   batch：
+   - 用户报名成功 -> 只保存数据库，不发公示。
+   - 用户编辑报名 -> 只更新数据库，不发公示。
+   - 用户撤回报名 -> 只更新数据库，不发公示。
+   - registration_end_at 到达 -> Bot 自动对所有 active 有效候选人逐个发送单独 Embed。
+   - registration_end_at 到 voting_start_at 之间 -> 视为公示期。
+   - voting_start_at 到达 -> Bot 自动进入投票阶段并发送统一投票器。
+   - 统一公示后管理员打回/撤销/恢复/编辑 -> 编辑该候选人的 Embed。
+
+4. 统一公示默认只公示 active 有效候选人。
+   - withdrawn 已撤回：不进入统一公示。
+   - rejected 已打回：不进入统一公示。
+   - revoked 已撤销：不进入统一公示。
+   管理员状态页和审计日志仍可看到完整记录。
+
+5. 报名结束后普通用户默认不能再编辑或撤回报名。
+   管理员仍可管理候选人。
+
+
+五、建议目录结构
+----------------
+新增：
+
+court_bot/election/
+  __init__.py
+  constants.py
+  models.py
+  database.py
+  permissions.py
+  embeds.py
+  views.py
+  modals.py
+  publicity_service.py
+  vote_service.py
+  result_service.py
+  scheduler.py
+  cog.py
+
+说明：
+
+1. constants.py
+   存放状态常量、模式常量、custom_id 前缀、默认限制。
+
+2. models.py
+   可选。定义 dataclass 或 TypedDict，增强可读性。
+
+3. database.py
+   新版募选专用 Repository。
+   只依赖 bot.db，不影响现有 CaseRepo / GuildSettingsRepo / InspectionDatabase。
+
+4. permissions.py
+   管理员权限、报名权限、投票权限检查。
+   初版管理命令使用 ManageGuild / Administrator。
+   投票权限初版即支持 allowed_voter_role_ids：用户拥有任意一个配置身份组即可投票。
+
+5. embeds.py
+   所有 Embed 和长文本拆分逻辑。
+   尤其处理：
+   - 候选人公示 Embed。
+   - 报名入口 Embed。
+   - 状态 Embed。
+   - 投票入口 Embed。
+   - 结果 Embed。
+   - 公示消息不得包含任何 mention。
+
+6. views.py
+   按钮和 SelectMenu：
+   - 报名入口 View。
+   - 字段选择 View。
+   - 统一投票分页 View。
+   - 投票确认 View。
+
+7. modals.py
+   Modal：
+   - 自我介绍 Modal。
+   - 管理员编辑 Modal。
+   - 打回原因 Modal。
+   - 撤销原因 Modal。
+
+8. publicity_service.py
+   公示服务。
+   负责：
+   - 实时公示创建。
+   - 实时公示同步。
+   - 报名结束后统一公示。
+   - 公示失败标记。
+   - 公示修复重试。
+   - 结果公示。
+
+9. vote_service.py
+   统一投票器创建、投票记录、分页选择缓存。
+
+10. result_service.py
+    统一计票和最终名单算法。
+
+11. scheduler.py
+    定时轮询状态：setup -> registration -> registration_ended -> voting -> completed。
+    对 batch 模式，报名结束时自动发布统一公示，投票开始时间到达后自动进入投票。
+
+12. cog.py
+    Slash Command Group 和 interaction 入口。
+
+
+六、数据库设计
+--------------
+建议不把新表塞进旧 CaseRepo，而是在 court_bot/election/database.py 中提供 ensure_schema()。
+在 ElectionCog.cog_load() 或 setup_hook 加载后执行。
+
+推荐表：
+
+1. pe_elections
+
+字段建议：
+- id INTEGER PRIMARY KEY AUTOINCREMENT
+- guild_id INTEGER NOT NULL
+- name TEXT NOT NULL
+- status TEXT NOT NULL
+  可选值：setup, registration, registration_ended, voting, completed, cancelled
+- vote_mode TEXT NOT NULL DEFAULT 'unified'
+- publicity_mode TEXT NOT NULL
+  可选值：realtime, batch
+- registration_channel_id INTEGER
+- voting_channel_id INTEGER
+- public_channel_id INTEGER NOT NULL
+- allowed_voter_role_ids TEXT
+  JSON array。允许投票的身份组 ID 列表。
+  空数组或 NULL 表示不限制，所有服务器成员可投票。
+  如果配置了多个身份组，用户拥有其中任意一个即可投票。
+- registration_entry_message_id INTEGER
+- vote_message_id INTEGER
+- vote_id INTEGER
+- vote_max_selections INTEGER NOT NULL
+- alert_channel_id INTEGER
+  可选。用于公示失败、自动流转受阻、计票异常等告警。未配置时回退到创建者私信或报名/公示频道的管理可见提示。
+- batch_publicity_status TEXT NOT NULL DEFAULT 'not_required'
+  可选值：not_required, pending, publishing, partial_failed, completed。
+  realtime 模式使用 not_required。
+  batch 模式报名结束自动公示时进入 publishing，全部成功后 completed，部分失败时 partial_failed。
+- batch_publicity_error TEXT
+- schedule_timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai'
+  固定按北京时间解释和展示。内部可保存 UTC ISO，但所有输入输出都以北京时间为准。
+- registration_duration_minutes INTEGER NOT NULL
+- publicity_duration_minutes INTEGER NOT NULL
+- voting_duration_minutes INTEGER NOT NULL
+- registration_start_at TEXT NOT NULL
+  由 start_at 或当前北京时间推导。
+- registration_end_at TEXT NOT NULL
+  registration_start_at + registration_duration_minutes。
+- voting_start_at TEXT NOT NULL
+  registration_end_at + publicity_duration_minutes。
+- voting_end_at TEXT NOT NULL
+  voting_start_at + voting_duration_minutes。
+- publicity_published_at TEXT
+  对 batch 模式：统一公示完成时间。
+  对 realtime 模式：可为空，或用于记录报名结束汇总公示时间。
+- created_by INTEGER NOT NULL
+- created_at TEXT NOT NULL
+- updated_at TEXT NOT NULL
+- completed_at TEXT
+- result_json TEXT
+- void_reason TEXT
+
+索引：
+- guild_id, status
+- registration_start_at
+- registration_end_at
+- voting_start_at
+- voting_end_at
+
+说明：
+- publicity_mode 创建后不可修改。
+- 初版只实现 vote_mode = unified。
+
+2. pe_fields
+
+字段建议：
+- id INTEGER PRIMARY KEY AUTOINCREMENT
+- election_id INTEGER NOT NULL
+- field_key TEXT NOT NULL
+  例如 field_1, field_2
+- name TEXT NOT NULL
+- winner_count INTEGER NOT NULL
+- sort_order INTEGER NOT NULL
+- created_at TEXT NOT NULL
+
+约束：
+- UNIQUE(election_id, field_key)
+- UNIQUE(election_id, sort_order)
+
+3. pe_registrations
+
+字段建议：
+- id INTEGER PRIMARY KEY AUTOINCREMENT
+- election_id INTEGER NOT NULL
+- guild_id INTEGER NOT NULL
+- user_id INTEGER NOT NULL
+- display_name TEXT NOT NULL
+- selected_field_keys TEXT NOT NULL
+  JSON array，例如 ["field_1", "field_2"]
+- self_intro TEXT
+- status TEXT NOT NULL
+  可选值：active, withdrawn, rejected, revoked
+- registered_at TEXT NOT NULL
+  首次报名时间。编辑不得刷新。
+- last_modified_at TEXT NOT NULL
+- public_message_id INTEGER
+  两种模式都使用该字段。
+  realtime：报名成功后立即写入。
+  batch：报名结束统一公示后写入。
+- public_channel_id INTEGER
+- public_sync_status TEXT NOT NULL DEFAULT 'pending'
+  可选值：not_published, pending, synced, failed
+  realtime 新报名：pending -> synced/failed。
+  batch 报名期：not_published。
+  batch 统一公示时：pending -> synced/failed。
+- public_sync_error TEXT
+- rejected_reason TEXT
+- rejected_by INTEGER
+- rejected_at TEXT
+- revoked_reason TEXT
+- revoked_by INTEGER
+- revoked_at TEXT
+
+约束：
+- UNIQUE(election_id, user_id)
+
+4. pe_votes
+
+字段建议：
+- id INTEGER PRIMARY KEY AUTOINCREMENT
+- election_id INTEGER NOT NULL
+- guild_id INTEGER NOT NULL
+- message_id INTEGER
+- channel_id INTEGER
+- max_selections INTEGER NOT NULL
+- created_at TEXT NOT NULL
+- closed_at TEXT
+
+5. pe_vote_records
+
+字段建议：
+- id INTEGER PRIMARY KEY AUTOINCREMENT
+- vote_id INTEGER NOT NULL
+- election_id INTEGER NOT NULL
+- voter_id INTEGER NOT NULL
+- selected_user_ids TEXT NOT NULL
+  JSON array，例如 ["123", "456"]
+- created_at TEXT NOT NULL
+
+约束：
+- UNIQUE(vote_id, voter_id)
+
+6. pe_audit_logs
+
+字段建议：
+- id INTEGER PRIMARY KEY AUTOINCREMENT
+- election_id INTEGER
+- guild_id INTEGER NOT NULL
+- operator_id INTEGER
+- action TEXT NOT NULL
+- detail_json TEXT
+- created_at TEXT NOT NULL
+
+用于追踪管理员操作、公示同步失败、投票清除、结果重算等。
+
+
+七、完整预计实现命令清单
+------------------------
+建议使用一个独立命令组：
+
+内部名：/election
+中文显示：/募选
+
+如果希望延续“公示募选”这个名字，也可以把中文本地化显示成 /公示募选。
+但从系统定位看，推荐显示为 /募选。
+
+A. 管理命令
+
+1. /募选 创建
+
+用途：创建一场募选。
+
+参数：
+- 名称 name: str
+- 岗位/字段配置 fields_config: str
+  格式：大当家:1,二当家:3,执行成员:9
+  岗位/字段名称和当选人数完全自定义，顺序就是最终取名单顺序。
+- 每人最多投票数 vote_max_selections: int
+- 公示模式 publicity_mode: Choice[str]
+  - 实时公示 = realtime
+  - 报名结束后统一公示 = batch
+- 报名持续时间 registration_duration: str
+  示例：3天、72小时、2天6小时、3d、12h。
+- 公示持续时间 publicity_duration: str
+  示例：1天、12小时、0小时。
+  对 batch 模式而言，这是报名结束后统一公示到投票开始之间的公示期。
+  对 realtime 模式而言，这是报名结束后的整理/缓冲期，可填 0小时。
+- 投票持续时间 voting_duration: str
+  示例：2天、48小时。
+- 报名频道 registration_channel: TextChannel
+- 投票频道 voting_channel: TextChannel
+- 公示频道 public_channel: TextChannel
+- 允许投票身份组 voting_roles: str，可选
+  格式：身份组ID用英文逗号分隔，例如 123,456,789。
+  也可以后续实现为最多 5 个 Role 参数：voting_role1/voting_role2/...。
+  不填表示所有服务器成员可投票。
+  填写多个时是 OR 规则：拥有其中任意一个身份组即可投票。
+- 告警频道 alert_channel: TextChannel，可选
+  用于统一公示失败、自动进入投票受阻等管理告警。未填写时使用公示频道或创建者私信兜底。
+- 报名开始时间 start_at: str，可选
+  格式建议：YYYY-MM-DD HH:mm。
+  不填则默认当前北京时间立即开始。
+- 是否立即发送入口 send_entry: bool = True
+
+时间说明：
+- 所有时间输入按北京时间 Asia/Shanghai，UTC+8 解析。
+- 创建成功后 Bot 自动计算并展示：报名开始、报名结束、公示结束/投票开始、投票结束。
+
+校验：
+- 只能在服务器中使用。
+- 需要 Manage Guild 或 Administrator。
+- 岗位/字段配置必须合法。
+- 岗位/字段数量初版建议 1 到 25；名称和人数不写死，由管理员自定义。
+- 每个岗位/字段 winner_count 必须大于 0。
+- vote_max_selections 必须大于 0。
+- voting_roles 如果填写，必须能解析为当前服务器存在的身份组，且至少一个有效身份组。
+- registration_duration 必须大于 0。
+- publicity_duration 必须大于或等于 0。
+- voting_duration 必须大于 0。
+- start_at 若填写，必须能按北京时间解析，且不应明显早于当前时间。
+- Bot 必须有目标频道的发送消息、编辑消息、查看频道权限。
+
+结果：
+- 写入 pe_elections。
+- 写入 pe_fields。
+- 保存持续时间分钟数和推导出的绝对时间。
+- 保存 allowed_voter_role_ids。
+- 如果 send_entry=True，发送报名入口消息。
+- 返回创建成功信息和 election_id。
+
+2. /募选 设置入口
+
+用途：发送或重发报名入口消息。
+
+参数：
+- 募选ID election_id: int，可选。
+- 频道 channel: TextChannel，可选。默认使用创建时的报名频道。
+
+行为：
+- 发送报名入口 Embed。
+- 附带 Persistent View：报名、我的报名、编辑报名、撤回报名。
+- 保存 registration_entry_message_id。
+
+3. /募选 状态
+
+用途：查看某场募选状态。
+
+参数：
+- 募选ID election_id: int，可选。
+
+展示：
+- 募选名称。
+- election_id。
+- 当前状态。
+- vote_mode。
+- publicity_mode。
+- 时区：北京时间 Asia/Shanghai。
+- 阶段持续时间：报名持续、公示/缓冲持续、投票持续。
+- 字段配置和顺序。
+- 每人最多投票数。
+- 推导后的报名/公示/投票时间点。
+- 报名总人数。
+- 有效候选人数。
+- 已撤回/已打回/已撤销人数。
+- 投票人数。
+- 公示频道。
+- 报名入口消息状态。
+- 统一公示发布时间。
+- 公示同步失败数量。
+
+4. /募选 列表
+
+用途：列出本服务器募选。
+
+参数：
+- 包含已完成 include_completed: bool = False
+
+展示：
+- 最近若干场募选。
+- ID、名称、状态、公示模式、报名时间、投票时间。
+
+5. /募选 候选人
+
+用途：管理员管理候选人。
+
+参数：
+- 操作 operation: Choice[str]
+  - 查看 = view
+  - 打回 = reject
+  - 撤销 = revoke
+  - 恢复 = restore
+  - 编辑 = edit
+  - 重发公示 = republish_publicity
+- 募选ID election_id: int，可选。
+- 用户 user: Member，可选。
+- 原因 reason: str，可选。
+
+行为：
+- 查看：显示候选人状态、字段、自我介绍、公示同步状态。
+- 打回：status = rejected，记录原因；如果已公示，更新候选人 Embed。
+- 撤销：status = revoked，记录原因；如果已公示，更新候选人 Embed。
+- 恢复：status = active；如果已公示，更新候选人 Embed。
+- 编辑：弹出管理员编辑 Modal，修改字段/自我介绍/显示名；如果已公示，更新候选人 Embed。
+- 重发公示：对该候选人重新发送或编辑公示 Embed。
+
+6. /募选 同步公示
+
+用途：修复公示同步失败，或强制刷新已公示候选人的 Embed。
+
+参数：
+- 募选ID election_id: int，可选。
+- 范围 scope: Choice[str]
+  - 失败项 = failed
+  - 全部已公示 = published
+  - 全部有效候选人 = active
+- 用户 user: Member，可选。
+
+行为：
+- 对符合条件的报名记录调用 publicity_service。
+- 若 public_message_id 存在，编辑原消息。
+- 若 public_message_id 不存在且允许发布，则发送新 Embed。
+- 更新 public_sync_status。
+
+7. /募选 开始投票
+
+用途：管理员应急手动开始投票，作为 scheduler 的补充。正常流程不需要执行。
+
+说明：
+- batch 模式的统一公示由 Bot 在报名结束后自动发布，不提供单独的“发布统一公示”常规命令。
+- 投票开始也会在 voting_start_at 到达后自动执行。
+
+参数：
+- 募选ID election_id: int，可选。
+
+限制：
+- 状态必须为 registration_ended。
+- batch 模式必须已经完成统一公示。
+- 当前时间原则上应达到 voting_start_at；管理员可视情况手动触发。
+
+行为：
+- 状态改为 voting。
+- 获取所有 active 候选人。
+- 创建统一投票器。
+- 发送投票入口 Embed 和按钮。
+- 写入 pe_votes 和 vote_message_id。
+
+8. /募选 结束并计票
+
+用途：管理员手动结束投票并计算结果，作为 scheduler 的补充。
+
+参数：
+- 募选ID election_id: int，可选。
+
+限制：
+- 状态必须为 voting。
+
+行为：
+- 关闭投票器。
+- 计算结果。
+- 写入 result_json。
+- 状态改为 completed。
+- 在公示频道发布结果 Embed。
+
+9. /募选 重算结果
+
+用途：completed 后重新计算结果。
+
+参数：
+- 募选ID election_id: int。
+- 是否重新公示 republish: bool = True
+
+行为：
+- 重新读取 active 报名和投票记录。
+- 按统一算法重新计算。
+- 更新 result_json。
+- 如 republish=True，重新发布或追加结果说明。
+
+10. /募选 清除投票
+
+用途：管理员应急作废某用户在统一投票中的投票记录。
+
+参数：
+- 募选ID election_id: int，可选。
+- 投票人 voter: Member
+- 原因 reason: str，可选。
+
+限制：
+- 默认仅 voting 状态允许。
+
+行为：
+- 删除 pe_vote_records 中该投票人的记录。
+- 写入 pe_audit_logs。
+- 投票提交后不能自助更改；清除投票是管理员应急作废，不默认允许该用户重新投票。
+- 若未来确实需要“清除后允许重投”，应另设明确参数 allow_revote，并写入审计日志；初版不提供。
+
+11. /募选 取消
+
+用途：取消一场未完成募选。
+
+参数：
+- 募选ID election_id: int，可选。
+- 原因 reason: str，可选。
+
+限制：
+- 允许 setup / registration / registration_ended / voting。
+- completed 不建议取消。
+
+行为：
+- 状态改为 cancelled。
+- 关闭报名入口或投票按钮。
+- 发送取消公告。
+- 写入审计日志。
+
+12. /募选 审计
+
+用途：查看管理员操作和关键系统事件。
+
+参数：
+- 募选ID election_id: int，可选。
+- 最近数量 limit: int = 20
+
+展示：
+- 创建募选。
+- 候选人打回/撤销/恢复。
+- 公示同步失败。
+- 清除投票。
+- 重算结果。
+- 取消募选。
+
+B. 用户相关命令或入口
+
+13. /募选 我的报名
+
+用途：用户查看自己的报名状态。
+
+参数：
+- 募选ID election_id: int，可选。
+
+展示：
+- 是否已报名。
+- 当前报名状态。
+- 参选字段。
+- 自我介绍。
+- 报名时间。
+- 最后修改时间。
+- 公示状态。
+
+说明：
+也可以只通过报名入口 View 的“我的报名”按钮实现。
+
+14. /募选 帮助
+
+用途：显示募选系统说明。
+
+展示：
+- 两种公示模式差异。
+- 报名规则。
+- 投票规则。
+- 结果规则。
+
+C. 按钮和组件，不一定做成 Slash Command
+
+报名入口 View：
+- 报名
+- 我的报名
+- 编辑报名
+- 撤回报名
+
+字段选择 View：
+- 多选字段 SelectMenu
+- 继续/取消
+
+投票入口 View：
+- 开始投票
+
+投票分页 View：
+- 候选人 SelectMenu
+- 上一页
+- 下一页
+- 查看已选
+- 清空选择
+- 完成选择
+
+投票确认 View：
+- 确认投票
+- 返回修改
+- 取消
+
+
+八、报名流程
+------------
+1. 管理员创建募选。
+2. 管理员发送报名入口，或创建时自动发送。
+3. 用户点击“报名”。
+4. Bot 检查：
+   - interaction.guild 不为空。
+   - 募选状态为 registration。
+   - 当前时间在报名期内。
+   - 用户未处于 revoked 状态。
+5. Bot 显示字段选择 SelectMenu。
+   - 允许多选。
+   - MinValues = 1。
+   - MaxValues = 字段数量。
+   - 初版建议字段数量最多 25。
+6. 用户选择愿意参选的字段。
+7. Bot 弹出自我介绍 Modal。
+   - 自我介绍可选。
+   - 建议限制 1000 字。
+8. 保存报名：
+   - 如果是新报名：写 registered_at = now。
+   - 如果是编辑 active/rejected 报名：保留原 registered_at，只更新 last_modified_at。
+9. 根据 publicity_mode 处理公示：
+   - realtime：立即发送或编辑该候选人的公示 Embed。
+   - batch：不发送公示，public_sync_status = not_published。
+10. 私密回复用户报名成功。
+
+
+九、实时公示流程 realtime
+------------------------
+1. 用户报名成功。
+2. publicity_service 生成候选人公示 Embed。
+3. 在 public_channel 发送消息：
+   - embed=候选人公示 Embed
+   - allowed_mentions=discord.AllowedMentions.none()
+4. 保存 public_message_id、public_channel_id。
+5. public_sync_status = synced。
+6. 后续状态变化时编辑同一条消息。
+
+同步入口：
+- 用户编辑报名。
+- 用户撤回报名。
+- 管理员打回。
+- 管理员撤销。
+- 管理员恢复。
+- 管理员编辑候选人。
+- 管理员执行同步公示。
+
+如果发送或编辑失败：
+- 不丢失报名。
+- public_sync_status = failed。
+- public_sync_error = 错误信息。
+- 写入 pe_audit_logs。
+- 管理员可执行 /募选 同步公示 修复。
+
+
+十、报名结束后统一公示流程 batch
+-------------------------------
+1. 报名阶段内，用户报名后不公开公示。
+2. 报名阶段内，用户可以编辑或撤回报名。
+3. 报名结束时间 registration_end_at 到达后，scheduler 自动将状态 registration -> registration_ended。
+4. 如果 publicity_mode = batch，scheduler 自动调用 publicity_service.publish_batch_publicity()；不需要管理员执行单独的发布命令。
+5. 获取所有 active 有效候选人。
+6. 对每一个有效候选人分别发送一条 Embed：
+   - 一名候选人 = 一条消息。
+   - 消息内容使用 Embed。
+   - 不使用任何 Discord mention。
+   - allowed_mentions=discord.AllowedMentions.none()。
+7. 每条报名记录写入自己的 public_message_id、public_channel_id。
+8. 每条报名记录 public_sync_status = synced 或 failed。
+9. election.publicity_published_at = now。
+10. registration_end_at 到 voting_start_at 之间视为公示期。
+11. 如果部分候选人发送失败，必须记录 failed，并允许管理员使用 /募选 同步公示 修复。
+12. voting_start_at 到达后，Bot 自动进入 voting 并发送统一投票器。
+
+统一公示候选人 Embed 内容应包含：
+- 募选名称。
+- 公示模式：报名结束后统一公示。
+- 候选人显示名。
+- 用户 ID。
+- 参选字段列表。
+- 自我介绍。
+- 报名时间。
+- 最后修改时间。
+- 当前状态：有效报名。
+
+默认不公示：
+- 已撤回 withdrawn。
+- 已打回 rejected。
+- 已撤销 revoked。
+
+统一公示后，如果管理员对候选人做状态变更：
+- 打回：编辑该候选人 Embed 为“已打回”。
+- 撤销：编辑该候选人 Embed 为“已撤销”。
+- 恢复：编辑该候选人 Embed 为“有效报名”。
+- 编辑：编辑该候选人 Embed 内容。
+
+
+十一、公示 Embed 规则
+--------------------
+所有候选人公示都用 Embed。
+
+候选人公示 Embed 建议字段：
+- 标题：候选人公示｜{募选名称}
+- 候选人：{display_name}
+- 用户 ID：{user_id}
+- 参选字段：大当家、执行成员
+- 自我介绍：{self_intro 或 “未填写”}
+- 报名时间：{registered_at}
+- 最后修改：{last_modified_at}
+- 当前状态：有效报名 / 已撤回 / 已打回 / 已撤销
+- 状态原因：打回原因、撤销原因等
+- 页脚：Election ID / Registration ID
+
+严禁内容：
+- <@user_id>
+- <@&role_id>
+- @everyone
+- @here
+
+发送和编辑消息时必须设置：
+allowed_mentions=discord.AllowedMentions.none()
+
+如果自我介绍太长：
+- 优先放入 Embed description 或 field。
+- 不能出现 mention。
+- 单个候选人信息不要被无意义截断。
+- 如果 Discord Embed 单条限制无法容纳，需提示候选人缩短自我介绍，或拆成附加普通文本消息。
+
+
+十二、统一投票流程
+------------------
+1. Scheduler 到达 voting_start_at 后：
+   - 状态 registration_ended -> voting。
+   - 如果 batch 模式，说明公示期结束；必须先确认 publicity_published_at 不为空。
+   - 获取所有 active 报名。
+   - 创建一个统一投票器。
+   - 候选人列表为所有 active 报名者。
+
+2. 投票器包含：
+   - 募选名称。
+   - 每人最多可投 vote_max_selections 人。
+   - 有效候选人数。
+   - 点击“开始投票”按钮。
+
+3. 用户点击开始投票：
+   - 检查投票权限。
+     - 如果 election.allowed_voter_role_ids 为空：允许所有服务器成员。
+     - 如果已配置多个投票身份组：用户拥有任意一个身份组即可投票。
+     - 不满足身份组要求时，私密提示“你没有本次募选投票资格”。
+   - 检查状态是否 voting。
+   - 检查是否已投票。
+   - 打开分页选择界面。
+
+4. 分页要求：
+   - Discord SelectMenu 每页最多 25 人。
+   - 页面只显示当前页候选人，不显示全部候选人，避免 Embed 超限。
+   - 可跨页选择。
+   - 显示已选择数量，例如 8/14。
+   - 如果选择数超过上限，提示用户取消部分选择。
+   - 点击“完成选择”后进入确认页。
+
+5. 确认投票：
+   - 再次检查是否已投票。
+   - 再次检查选择数量。
+   - 写入 pe_vote_records。
+   - 私密提示投票成功。
+
+6. 防重复投票：
+   - pe_vote_records 使用 UNIQUE(vote_id, voter_id)。
+   - 用户重复点击确认时，数据库约束兜底。
+
+
+十三、结果计算算法
+------------------
+输入：
+- election
+- fields ordered by sort_order
+- active registrations
+- vote records
+
+步骤：
+1. 如果没有 vote records：
+   返回 is_void = true，void_reason = '无人投票，本次募选作废'。
+
+2. 统计票数：
+   vote_counts[user_id] = 得票数。
+
+3. 初始化：
+   selected_user_ids = set()
+   result_fields = []
+
+4. 按字段顺序循环：
+   对每个 field：
+   - pool = active registrations 中 selected_field_keys 包含 field_key 的人
+   - 排除 user_id in selected_user_ids
+   - 每个候选人附加 votes、registered_at
+   - 排序：
+     a. votes 降序
+     b. registered_at 升序
+     c. user_id 字典序升序
+   - winners = pool[:field.winner_count]
+   - selected_user_ids 加入 winners
+   - vacancies = field.winner_count - len(winners)
+
+5. 保存 result_json：
+   {
+     "vote_mode": "unified",
+     "publicity_mode": "realtime 或 batch",
+     "is_void": false,
+     "total_voters": N,
+     "total_votes": M,
+     "fields": [
+       {
+         "field_key": "field_1",
+         "field_name": "大当家",
+         "winner_count": 1,
+         "vacancies": 0,
+         "winners": [...],
+         "candidates": [...]
+       }
+     ],
+     "calculated_at": "..."
+   }
+
+注意：
+- 不补位。
+- 已在前面字段当选的人，不参与后续字段。
+- 同票不再需要旧式并列分析，因为报名时间已作为裁定条件。
+- 0 票候选人不是自动作废；只有无人投票才整场作废。
+
+
+十四、定时器设计
+----------------
+新增 ElectionScheduler。
+建议在 ElectionCog.cog_load() 中启动后台 task。
+
+轮询间隔：60 秒。
+
+状态流转：
+
+1. setup -> registration
+   条件：now >= registration_start_at 且 now < registration_end_at
+   动作：
+   - 更新报名入口为可报名。
+   - 可发送报名开始提示。
+
+2. registration -> registration_ended
+   条件：now >= registration_end_at
+   动作：
+   - 关闭报名入口。
+   - 发送报名结束汇总。
+   - 如果 publicity_mode = batch，自动发布统一公示：每名 active 候选人单独一条 Embed。
+   - 写入 publicity_published_at。
+
+3. registration_ended -> voting
+   条件：now >= voting_start_at 且 now < voting_end_at
+   附加条件：
+   - realtime 模式：可直接开始。
+   - batch 模式：registration_end_at 到 voting_start_at 之间为公示期；publicity_published_at 不为空。如果为空则先补发统一公示。
+   动作：
+   - 创建统一投票器。
+   - 发送投票开始提示。
+
+4. voting -> completed
+   条件：now >= voting_end_at
+   动作：
+   - 关闭投票按钮。
+   - 计算结果。
+   - 公布结果。
+
+5. 异常恢复：
+   Bot 重启后，scheduler 应能根据当前时间补执行缺失动作。
+   例如：
+   - 已过报名开始但状态仍 setup：补进入 registration。
+   - 已过报名结束但 batch 统一公示未发布：补发每候选人 Embed。
+   - 已过投票开始但 vote_message_id 为空：补创建投票器。
+   - 已过投票结束但结果未计算：补计算并公布结果。
+
+时间来源：
+- Scheduler 使用 pe_elections 中保存的推导后绝对时间。
+- 这些绝对时间由创建命令根据北京时间 start_at 和持续时间自动计算。
+- 内部比较建议统一转为 timezone-aware datetime；数据库可保存 UTC ISO，同时保存 schedule_timezone='Asia/Shanghai' 供展示。
+
+
+十五、结果展示
+--------------
+结果消息不自动发身份组，只公布名单。
+
+结果 Embed 建议：
+- 标题：某某募选结果
+- 如果作废：显示作废原因。
+- 如果有效：
+  - 总投票人数。
+  - 总票数。
+  - 每人最多可投。
+  - 公示模式。
+  - 每个字段的当选名单。
+  - 每个字段的空缺人数。
+
+字段展示示例：
+
+大当家，当选 1/1
+1. 张三（用户ID：123）— 20票，报名时间：2026-05-01 12:00
+
+执行成员，当选 8/9，空缺 1
+1. 李四（用户ID：456）— 18票，报名时间：...
+...
+
+如果内容超限：
+- 按字段拆分多条消息。
+- 不截断单个候选人的关键信息。
+- 不使用 mention。
+- allowed_mentions=discord.AllowedMentions.none()。
+
+
+十六、权限建议
+--------------
+初版：
+- 管理命令：需要 Manage Guild 或 Administrator。
+- 报名：默认所有服务器成员可报名。
+- 投票：支持身份组限制。
+  - 创建募选时可配置多个允许投票身份组。
+  - 用户拥有任意一个配置身份组即可投票。
+  - 如果未配置投票身份组，则默认所有服务器成员可投票。
+
+后续可加：
+- 报名允许身份组。
+- 阶段通知身份组。
+
+注意：
+投票身份组限制已纳入第一阶段需求；报名允许身份组、阶段通知身份组可作为第二阶段扩展。
+
+
+十七、完整程序流程
+------------------
+A. Bot 启动流程
+
+1. main.py 启动 CourtBot。
+2. CourtBot.setup_hook() 连接数据库。
+3. 加载 court_bot.election.cog。
+4. ElectionCog.cog_load()：
+   - 初始化 ElectionRepo。
+   - 执行 ensure_schema()。
+   - 注册 Persistent Views。
+   - 启动 ElectionScheduler。
+5. 同步 Slash Commands。
+
+B. 创建募选流程
+
+1. 管理员执行 /募选 创建。
+2. Cog 校验权限、字段配置、时间、频道权限。
+3. Repo 写入 pe_elections。
+4. Repo 写入 pe_fields。
+5. 若 send_entry=True，发送报名入口。
+6. 记录审计日志。
+7. 私密回复管理员创建成功。
+
+C. 报名流程
+
+1. 用户点击报名入口“报名”。
+2. View 检查当前状态和时间。
+3. 展示字段多选 SelectMenu。
+4. 用户选择字段。
+5. 弹出自我介绍 Modal。
+6. Modal submit 后写入或更新 pe_registrations。
+7. 如果 publicity_mode=realtime：
+   - 调用 publicity_service.sync_registration_publicity()。
+   - 发送或编辑候选人 Embed。
+8. 如果 publicity_mode=batch：
+   - 不发送公示。
+   - public_sync_status=not_published。
+9. 私密回复用户。
+
+D. 编辑报名流程
+
+1. 用户点击“编辑报名”或执行 /募选 我的报名 后进入编辑。
+2. 检查状态必须仍在 registration。
+3. 重新选择字段并填写自我介绍。
+4. 保存时保留 registered_at。
+5. realtime：更新同一条候选人 Embed。
+6. batch：如果尚未统一公示，只更新数据库；如果已经公示，则更新对应候选人 Embed。
+
+E. 撤回报名流程
+
+1. 用户点击“撤回报名”。
+2. 检查状态必须仍在 registration。
+3. status 改为 withdrawn。
+4. realtime：编辑公示 Embed 为“已撤回”。
+5. batch：如果尚未统一公示，不发公示；如果已经公示，则编辑 Embed 为“已撤回”。
+
+F. 管理员候选人管理流程
+
+1. 管理员执行 /募选 候选人。
+2. 根据操作执行查看、打回、撤销、恢复、编辑、重发公示。
+3. 写入 pe_audit_logs。
+4. 如果候选人已经有 public_message_id，必须编辑对应 Embed。
+5. 如果是 batch 模式且尚未统一公示，则只更新数据库，不提前公开。
+
+G. 报名结束流程
+
+1. Scheduler 检测 now >= registration_end_at。
+2. 状态 registration -> registration_ended。
+3. 关闭报名入口按钮。
+4. 如果 realtime：
+   - 候选人已经逐个公示。
+   - 可发送报名结束汇总。
+5. 如果 batch：
+   - 获取 active 有效候选人。
+   - 每个候选人单独发送一条 Embed 到公示频道。
+   - 逐条写入 public_message_id。
+   - 设置 publicity_published_at。
+6. 若公示失败，标记 failed，管理员可同步修复。
+7. registration_end_at 到 voting_start_at 之间为公示期。
+
+H. 投票开始流程
+
+1. Scheduler 检测 now >= voting_start_at。
+2. 检查状态 registration_ended。
+3. 若 batch 模式且未统一公示，则先补发统一公示。
+4. 获取 active 候选人。
+5. 创建 pe_votes。
+6. 发送统一投票入口 Embed。
+7. 状态改为 voting。
+
+I. 用户投票流程
+
+1. 用户点击“开始投票”。
+2. 检查状态 voting。
+3. 检查是否已投票。
+4. 展示分页候选人选择界面。
+5. 用户跨页选择候选人。
+6. 用户点击完成选择。
+7. Bot 展示确认页。
+8. 用户点击确认投票。
+9. 再次检查是否已投票和选择数量。
+10. 写入 pe_vote_records。
+11. 私密提示投票成功。
+
+J. 投票结束和结果流程
+
+1. Scheduler 检测 now >= voting_end_at。
+2. 关闭投票按钮。
+3. 读取投票记录。
+4. 如果无人投票，结果作废。
+5. 如果有人投票，按统一算法计算结果。
+6. 写入 result_json。
+7. 状态改为 completed。
+8. 在公示频道发布结果 Embed。
+
+K. 公示同步修复流程
+
+1. 管理员执行 /募选 同步公示。
+2. 查询 public_sync_status=failed 或指定范围。
+3. 对每条报名：
+   - 有 public_message_id：编辑消息。
+   - 无 public_message_id 且允许发布：发送新 Embed。
+4. 更新 public_sync_status。
+5. 输出修复结果。
+
+L. Bot 重启恢复流程
+
+1. Scheduler 启动后扫描未完成募选。
+2. 根据当前时间和状态补执行缺失动作。
+3. 对 Persistent View 重新注册 custom_id。
+4. 入口按钮和投票按钮在重启后继续可用。
+
+
+十八、实施与进度记录
+------------------
+用户已确认不再拆“一期/二期”，直接按完善版本实现，并在实现过程中记录进度与实现方式。
+
+当前实现策略：
+- 保持 court_bot/election/ 独立模块，不嵌入 court 或 inspection 业务逻辑。
+- 一次性纳入完整规则：实时公示、统一公示、身份组投票限制、统一投票、字段自定义、Scheduler 自动流转、失败告警、作废逻辑、审计日志。
+- 每轮实现进度同步记录到 .limcode/progress.md。
+
+已实现核心文件：
+- court_bot/election/__init__.py
+- court_bot/election/constants.py
+- court_bot/election/time_utils.py
+- court_bot/election/text_utils.py
+- court_bot/election/models.py
+- court_bot/election/permissions.py
+- court_bot/election/database.py
+- court_bot/election/embeds.py
+- court_bot/election/publicity_service.py
+- court_bot/election/vote_service.py
+- court_bot/election/result_service.py
+- court_bot/election/scheduler.py
+- court_bot/election/views.py
+- court_bot/election/cog.py
+
+已接入：
+- court_bot/bot.py setup_hook 已加载 court_bot.election.cog。
+
+已实现能力：
+- /募选 创建：使用北京时间 + 持续时间模型创建募选。
+- /募选 设置入口：发送或重发报名入口。
+- /募选 状态：查看募选状态。
+- /募选 列表：列出募选。
+- /募选 候选人：管理员查看、打回、撤销、恢复、重发公示。
+- /募选 同步公示：修复失败公示或刷新公示。
+- /募选 投票身份组：查看或更新本场募选允许投票身份组，投票开始后禁止修改。
+- /募选 运维自检：检查未完成募选、频道权限、身份组缺失、公示状态，不推进状态。
+- /募选 运维tick：手动执行一次 Scheduler tick；需要 confirm=True，会实际推进到期状态。
+- /募选 计票预览：只计算并预览当前结果，不写入、不发布。
+- /募选 开始投票：应急手动开始投票。
+- /募选 结束并计票：应急手动结束并计票。
+- /募选 重算结果：重新计算并发布结果。
+- /募选 清除投票：作废某人投票记录，默认不允许重投。
+- /募选 取消：取消募选。
+- /募选 审计：查看审计日志。
+- /募选 我的报名：查看自己的报名。
+- /募选 帮助：查看规则说明。
+
+已实现规则：
+- publicity_mode 支持 realtime / batch。
+- 两种公示模式均是一名候选人一条 Embed。
+- batch 模式报名期不公开候选人；报名结束后由 Scheduler 自动逐条公示。
+- batch 公示部分失败时写入 batch_publicity_status=partial_failed 并告警。
+- batch 公示未完整成功且到达投票开始时间时，本次募选作废。
+- 无有效候选人作废。
+- 无人投票作废。
+- publicity_duration=0 可用。
+- 投票开始后候选人锁定。
+- 撤回后重新报名刷新 registered_at；编辑报名不刷新 registered_at。
+- 候选人宣言和公示内容会清理 mention，并使用 allowed_mentions=discord.AllowedMentions.none()。
+- 投票身份组限制：allowed_voter_role_ids 为空则所有成员可投票；配置多个身份组则拥有任意一个即可投票。
+- 投票不可更改。
+- 不公开 voter -> candidate 映射。
+- 计票按字段顺序取人；同票按票数降序、registered_at 升序、user_id 字典序；前字段当选者从后字段移除；不补位。
+
+实现补强记录：
+- 关键数据库写入已使用 asyncio.Lock + SQLite BEGIN IMMEDIATE 事务：创建募选、报名 upsert、写入投票、作废投票。
+- 创建募选时检查 Bot 在报名/投票/公示/告警频道的 View Channel、Send Messages、Embed Links、Read Message History 权限。
+- 候选人提交参选宣言时拒绝用户提及、身份组提及、@everyone、@here；公示时仍会再次 sanitize 并禁用 allowed_mentions。
+- 投票开始后禁止修改 allowed_voter_role_ids；投票结束时会写入 pe_votes.closed_at。
+- 手动开始投票可用于修复投票阶段中缺失投票面板的异常情况。
+
+已通过检查：
+- python -m compileall court_bot 通过，补强后再次通过。
+- python -m compileall court_bot tests tools 通过。
+- python -m unittest discover -s tests -v 通过，当前 9 个测试。
+- python tools/election_smoke_test.py 通过。
+
+自动化测试与运维工具：
+- tests/test_election_core.py
+  - 覆盖持续时间解析、北京时间转 UTC、字段配置解析、身份组 OR 投票规则、mention 检测/清理。
+  - 使用临时 SQLite 覆盖 pe_* schema、创建募选、报名编辑不刷新 registered_at、撤回后重报刷新 registered_at、投票不可重复、无人报名/无人投票作废、计票字段锁定和同票规则。
+- tools/election_smoke_test.py
+  - 不连接 Discord，只使用临时数据库跑一条完整 smoke 流程。
+  - 适合部署前快速验证核心数据库和计票逻辑。
+- 推荐本地/部署前命令：
+  - python -m compileall court_bot tests tools
+  - python -m unittest discover -s tests -v
+  - python tools/election_smoke_test.py
+- 测试服内运维命令：
+  - /募选 运维自检
+  - /募选 运维tick confirm=True
+  - /募选 计票预览
+
+待服务器内手测重点：
+- Discord slash command 本地化名称是否符合预期。
+- Persistent View 在重启后是否能准确根据 message_id 找回募选。
+- 报名 Modal、投票 Select、分页、确认按钮的真实 Discord 交互体验。
+- batch 模式报名期隐私、报名结束自动公示、失败修复、投票开始作废策略。
+- 身份组投票限制在真实 guild 内校验。
+- Scheduler 重启补偿是否符合预期。
+- 各频道缺少 Send Messages / Embed Links / View Channel 权限时的告警路径。
+
+
+十九、风险点
+------------
+1. SQLite 并发
+   多人同时报名时可能有并发写入。aiosqlite 单连接相对稳定，但建议关键写操作尽量串行，必要时加 asyncio.Lock。
+
+2. 公示消息一致性
+   报名保存成功但公示发送失败时，需要 public_sync_status 标记和补同步命令。
+
+3. Discord 消息长度
+   候选人公示、候选人列表、结果展示都要避免超过限制。
+   候选人单独 Embed 能降低统一公示超限风险。
+
+4. Persistent View
+   如果按钮需要重启后仍可用，View custom_id 必须稳定，且 bot 启动后要 add_view 或使用无 timeout persistent view。
+
+5. 时间解析
+   统一使用北京时间 Asia/Shanghai，UTC+8。
+   创建命令优先使用“开始时间 + 持续时间”配置，而不是管理员手动输入每个阶段的起止时间。
+   持续时间解析建议支持：3天、72小时、2天6小时、3d、12h、0小时。
+   保存时建议转 ISO UTC，同时保存 schedule_timezone='Asia/Shanghai'，展示时再转回北京时间。
+
+6. 命令同步
+   当前 bot 支持 COMMAND_GUILD_IDS。新增 Cog 后应确认命令能同步到目标 guild。
+
+7. Batch 模式信息提前泄露
+   batch 模式下，报名期内不能在公示频道发送候选人信息。
+   管理员命令返回候选人列表时应默认 ephemeral。
+
+8. 统一公示失败
+   如果部分候选人 Embed 发布失败，不应直接进入投票，或至少要明确标记失败并提示管理员修复。
+   推荐：batch 模式必须 publicity_published_at 不为空才自动进入投票。
+
+
+二十、推荐最终决策
+------------------
+推荐执行：
+
+在 C:\Users\liuyuxuan\Desktop\破解区 这个 Python bot 中，从零新增一个独立 Cog：court_bot.election.cog。
+
+系统名称：募选系统。
+
+核心能力：
+1. 岗位/字段名称完全自定义。
+2. 岗位/字段人数和顺序完全自定义。
+3. 报名者选择参选字段池。
+4. 统一投票。
+5. 支持实时公示。
+6. 支持报名结束后自动统一公示。
+7. 两种公示模式都采用“每候选人一条单独 Embed”。
+8. 统一结果算法。
+9. 公示不艾特。
+10. 不自动发身份组。
+
+不建议：
+1. 在旧 JS bot 的 src/modules/election/ 中直接硬改。
+2. 把新逻辑塞进现有 court.py 或 inspection 模块。
+3. 使用固定字段 general/executive 写死逻辑。
+4. 把统一公示做成一条巨大的候选人列表消息。
+
+推荐原则：
+1. 新系统独立。
+2. 字段配置完全自定义。
+3. 计票算法通用化，支持任意数量字段。
+4. 公示服务作为一等功能设计。
+5. 实时公示和统一公示共用同一套候选人 Embed 渲染。
+6. 旧功能完全不动。
+
+
+
+二十一、补充审查：潜在问题、澄清项与复用边界
+------------------------------------------
+本节用于落实“可以复用已有函数，但不能过度嵌入”的原则，并列出实现前需要明确的边界。
+
+A. 可以复用的现有能力
+
+1. Cog 加载和 Slash Command 注册模式
+   - 参考 court_bot/cogs/court.py 和 court_bot/inspection/cog.py。
+   - 新 Cog 仍通过 bot.tree.add_command(group) 注册。
+   - 若配置了 COMMAND_GUILD_IDS，则按现有模式注册为 Guild Command。
+
+2. 本地化命令名模式
+   - 复用 discord.app_commands.locale_str 的写法。
+   - 内部命令名建议保持英文，例如 election。
+   - 中文显示使用“募选”。
+
+3. 数据库基础连接
+   - 可以复用 court_bot.services.db.Database 的 execute/fetchone/fetchall/insert_and_get_id 等基础能力。
+   - 但 ElectionRepo 必须独立，不复用 CaseRepo。
+   - 新表必须全部使用 pe_ 前缀，避免污染旧表。
+
+4. UTC 时间保存思路
+   - 可以复用 utc_now_iso 一类思路。
+   - 但 election 模块应建立自己的 time_utils.py 或在 constants/utils 中封装北京时间解析与展示，避免依赖 inspection.utils。
+
+5. 频道获取工具
+   - 可以复用 bot.get_channel_or_thread(channel_id) 的思路或直接调用它。
+   - 但 election 服务不应调用议诉业务方法。
+
+6. Persistent View / on_interaction 模式
+   - 可参考现有 CourtView 的 persistent view 写法。
+   - 也可参考 inspection 的 custom_id 前缀监听写法。
+   - ElectionCog 应在自己的 cog_load/on_interaction 内处理 pe_ 或 pe: 前缀，不要把 election view 恢复逻辑塞进 CourtBot.restore_persistent_views。
+
+7. allowed_mentions 用法
+   - 复用现有 allowed_mentions=discord.AllowedMentions.none() 的安全写法。
+   - 所有候选人公示、统一公示、结果公示都必须使用。
+
+B. 不应过度嵌入的部分
+
+1. 不复用 CaseRepo / court.py 业务逻辑
+   - 募选不是议诉案件。
+   - 不应把募选状态、报名、投票、结果写入 cases 相关表。
+
+2. 不复用 InspectionDatabase / InspectionSettingsService / Inspection VoteService
+   - 监察组功能的数据模型、流程和投票含义不同。
+   - 可以参考实现方式，但不要 import 并直接调用监察服务。
+
+3. 不依赖议诉系统 guild_settings 作为募选配置
+   - 初版募选管理权限建议只用 Discord 原生 Administrator / Manage Guild。
+   - 如果将来要支持募选管理员身份组，应单独建立 pe_settings 或 pe_guild_settings。
+   - 不建议让“是否能管理募选”依赖“议诉系统是否已配置管理员身份组”。
+
+4. 不把 Election 的 persistent view 恢复硬塞进 CourtBot.restore_persistent_views
+   - 只需要在 bot.py 加载 extension：court_bot.election.cog。
+   - ElectionCog 自己在 cog_load 中恢复报名入口和投票入口 View。
+
+5. 不使用现有 admin_mention 或任何会生成 mention 的辅助函数发布公示
+   - 公示系统不能艾特用户或身份组。
+   - 即使 allowed_mentions.none() 能阻止 ping，公示文本本身也应尽量不出现 <@...>、<@&...>、@everyone、@here。
+
+C. 当前仍需在实现中明确的规则
+
+1. Batch 统一公示失败时是否进入投票
+   - 确认规则：batch 模式报名结束后自动发布统一公示；如果部分或全部失败，Bot 先报警。
+   - 报警对象：优先 alert_channel_id；未配置时回退到公示频道管理提示、创建者私信或审计日志。
+   - 管理员在公示期 registration_end_at 到 voting_start_at 之间有补救时间，可执行 /募选 同步公示。
+   - 到 voting_start_at 时，如果仍未完整成功，则不进入投票，本次募选作废。
+   - 仅有 publicity_published_at 不够，建议 pe_elections 增加：
+     - batch_publicity_status TEXT DEFAULT 'not_required'
+       可选值：not_required, pending, publishing, partial_failed, completed
+     - batch_publicity_error TEXT
+   - voting_start_at 到达时，如果 batch_publicity_status != completed：
+     - 不创建投票器。
+     - 状态进入 completed。
+     - result_json 标记 is_void=true。
+     - void_reason='统一公示未完整成功，本次募选作废'。
+     - 写入 pe_audit_logs，并在可用频道发送作废说明。
+
+2. 无有效候选人时如何处理
+   - 如果报名结束后 active 候选人数为 0：
+     - 不创建投票器。
+     - 募选可直接进入 completed。
+     - result_json 标记 is_void=true。
+     - void_reason='无人有效报名，本次募选作废'。
+     - 在公示频道发送作废说明。
+
+3. 公示持续时间为 0 的处理
+   - 允许 publicity_duration = 0。
+   - batch 模式下，scheduler 同一轮可以先发布统一公示，再立即进入投票。
+   - 必须保证动作顺序是：先公示，后创建投票器。
+
+4. 候选人管理的阶段锁定
+   - 推荐初版规则：候选人字段、自我介绍、状态管理只允许在 voting 前进行。
+   - 进入 voting 后，候选人名单应锁定，避免已投票记录和候选池发生冲突。
+   - voting 后如发现严重问题，建议管理员取消整场募选，或结束后重算结果时明确记录审计原因。
+
+5. 用户撤回后重新报名
+   - 确认规则：用户撤回报名后，在报名期内再次报名，刷新 registered_at。
+   - 用户只是修改参选宣言/自我介绍或调整报名信息时，不刷新 registered_at，只更新 last_modified_at。
+   - rejected 后修改重提也不刷新 registered_at，除非该报名先被撤回后重新报名。
+   - revoked 状态默认不允许用户自助重新报名，只能管理员恢复。
+
+6. 多场募选并存时的 election_id 规则
+   - 数据库允许同服务器存在多场募选。
+   - 命令中的 election_id 可以可选，但如果当前服务器同时存在多场未完成募选，则必须要求管理员显式填写 election_id。
+   - “自动选择当前募选”只适用于未完成募选恰好只有一场的情况。
+
+7. Batch 模式报名期隐私
+   - batch 模式报名期内，公开入口和公开状态不应展示报名人数、候选人名单、候选人字段选择等可能泄露报名情况的信息。
+   - 管理员查看候选人列表时必须 ephemeral。
+   - 审计日志如果发到频道，应避免泄露完整候选人自我介绍；详细信息只保存在数据库。
+
+8. 公示文本和用户输入净化
+   - 不仅系统不能主动生成 mention，用户填写的自我介绍、显示名、岗位名也可能包含 mention-like 文本。
+   - 发布到公示频道前需要统一 sanitize：
+     - 替换或转义 < 和 >。
+     - 将 @everyone、@here、<@123>、<@&123> 变成不可 ping 且不按 mention 样式展示的文本。
+   - allowed_mentions.none() 仍必须保留。
+
+9. 时间展示
+   - 所有输入按北京时间 Asia/Shanghai 解析。
+   - 数据库存储建议 UTC ISO。
+   - 展示时建议同时给出：
+     - 明确文本：2026-05-01 20:00 北京时间。
+     - 可选 Discord timestamp：<t:...:F>。
+   - 不能只依赖 Discord timestamp，因为不同用户客户端会按本地时区显示。
+
+10. 持续时间解析边界
+    - 推荐支持：天、小时、分钟、d、h、m。
+    - 不建议支持“月”，因为月份长度不固定。
+    - 不建议支持小数，避免 1.5天 解析歧义；如需要可让用户填 36小时。
+    - registration_duration > 0。
+    - publicity_duration >= 0。
+    - voting_duration > 0。
+    - 可设置合理上限，例如单阶段不超过 30 天。
+
+11. Discord 限制
+    - SelectMenu 每页最多 25 个选项。
+    - 岗位/字段初版建议最多 25 个。
+    - 候选人投票选择必须分页。
+    - custom_id 最长 100 字符，不能把长字段名塞进 custom_id。
+    - Select option value 最长 100 字符，应使用 field_key 或 user_id，不使用长显示名。
+    - Embed 单字段 1024 字符，总长度 6000 字符；自我介绍建议限制 1000 字以内。
+
+12. vote_max_selections 大于候选人数
+    - 可以允许。
+    - UI 实际可选上限应为 min(vote_max_selections, active_candidate_count)。
+    - 结果页仍显示管理员配置的 vote_max_selections。
+
+13. 投票隐私与修改
+    - 确认规则：不公开谁投给谁。
+    - 投票提交后不能自助修改。
+    - 初版中，管理员可用 /募选 清除投票 作废某人的投票记录，但不默认允许该用户重新投票。
+    - 清除投票必须填写或记录原因，并写入审计日志。
+    - /募选 状态 只显示投票人数，不公开每个投票人的选择。
+    - pe_vote_records 虽然保存 selected_user_ids，但不应通过普通命令暴露明细。
+
+14. Scheduler 幂等性
+    - 每个状态流转动作必须可重复执行而不会重复发消息。
+    - 例如：
+      - 已有 registration_entry_message_id 时不要重复发入口，除非管理员设置入口。
+      - batch 公示时已有 public_message_id 的候选人应编辑原消息，不要重复发送。
+      - 已有 vote_message_id 时不要重复创建投票器。
+      - 已 completed 且 result_json 存在时不要重复公布结果，除非执行重算。
+
+15. 数据库并发
+    - 多人同时报名、投票确认、scheduler 同时流转可能产生竞争。
+    - ElectionRepo 应有自己的 asyncio.Lock，至少保护：
+      - 创建募选与字段写入。
+      - 报名 upsert。
+      - 撤回/恢复/打回。
+      - 投票写入。
+      - scheduler 状态流转。
+    - 关键约束仍应交给数据库兜底，例如 UNIQUE(election_id, user_id)、UNIQUE(vote_id, voter_id)。
+
+
+二十二、现有模块与未来募选模块的鉴权系统
+--------------------------------------
+本节用于明确当前 bot 整体鉴权现状，以及未来募选模块不应过度嵌入现有模块鉴权的设计。
+
+A. 议诉模块 court 的现状
+
+1. 模块命令组
+   - 内部命令组：court。
+   - 中文显示：议诉。
+   - 主要文件：court_bot/cogs/court.py、court_bot/views/*、court_bot/bot.py。
+
+2. 议诉初始化命令 /议诉 设置
+   - 鉴权方式：Discord 原生权限。
+   - 需要 Administrator 或 Manage Guild。
+   - 原因：初始化阶段还没有议诉管理身份组配置，不能依赖 bot.is_admin。
+
+3. 议诉普通申请命令 /议诉 申请
+   - 面向普通成员。
+   - 要求在服务器内使用。
+   - 需要议诉系统已配置审核频道等基础设置。
+   - 不要求管理员权限。
+
+4. 议诉入口按钮“提交议诉申请”
+   - 面向普通成员。
+   - 需要服务器内使用。
+   - 需要议诉系统已配置。
+   - 不要求管理员权限。
+
+5. /议诉 补充证据
+   - Slash 命令本身会定位案件并打开 Modal。
+   - Modal 提交时检查：当事人或议诉管理员。
+   - 当事人包括投诉人、被投诉人。
+   - 管理员使用 bot.is_admin。
+
+6. 议诉管理按钮和管理命令
+   - 审核通过、驳回、要求补证、裁决、强制结束、归档、发布入口等操作使用 bot.is_admin。
+   - bot.is_admin 的规则：
+     - 如果 guild_settings.admin_role_ids 已配置：
+       - Administrator 永远兜底允许。
+       - 拥有配置的管理身份组之一则允许。
+       - 注意：此时 Manage Guild 本身不再自动等于议诉管理，除非同时拥有配置的管理身份组或 Administrator。
+     - 如果 guild_settings.admin_role_ids 未配置：
+       - Administrator 或 Manage Guild 允许，用于初始化/兜底。
+
+7. 议诉 on_message 管控
+   - 在议诉频道内，非当前发言者发言会被限制。
+   - 管理员判断同样使用 bot.is_admin。
+
+B. 监察模块 inspection 的现状
+
+1. 模块命令组
+   - 内部命令组：inspection。
+   - 中文显示：监察。
+   - 主要文件：court_bot/inspection/cog.py。
+
+2. 管理权限函数
+   - inspection 使用自己的 _admin_required。
+   - _admin_required 调用 inspection.utils.is_server_admin。
+   - is_server_admin 当前规则：
+     - 服务器所有者允许。
+     - Administrator 允许。
+   - Manage Guild 不算监察管理员。
+   - 议诉系统配置的 admin_role_ids 不影响监察模块。
+
+3. /监察 设置
+   - 需要服务器所有者或 Administrator。
+   - 可配置监察候补身份组、通知频道、讨论分类、裁决公示频道、留任周期、归档频道等。
+
+4. /监察 成员管理
+   - 主动退出 self_exit：候补成员自己可用，不要求管理员。
+   - 添加候补、移除候补、查看名单、设置留任：需要服务器所有者或 Administrator。
+
+5. /监察 启动监察
+   - 需要服务器所有者或 Administrator。
+   - 还需要监察配置完整。
+
+6. /监察 案件管理
+   - 查看状态、Ban并抽取、无Ban抽取、补抽、取消：需要服务器所有者或 Administrator。
+   - 还需要监察配置完整。
+
+7. /监察 投票面板
+   - 可由服务器所有者或 Administrator 执行。
+   - 也允许本案临时监察成员在对应临时讨论频道召唤投票面板。
+   - 具体服务层规则：不是管理员且不在本案 selected 临时监察成员列表中，则拒绝。
+
+8. /监察 归档
+   - 需要服务器所有者或 Administrator。
+   - 还需要监察配置完整。
+
+9. 监察投票按钮
+   - 按钮由 on_interaction 监听 insp_ 前缀。
+   - 投票资格由 VoteService 依据案件成员、案件状态、投票状态判断。
+   - 与议诉 admin_role_ids 无关。
+
+C. 未来募选模块 election 的建议鉴权
+
+1. 模块独立
+   - 内部命令组：election。
+   - 中文显示：募选。
+   - 不依赖议诉 guild_settings.admin_role_ids。
+   - 不依赖监察 _admin_required。
+   - 在 court_bot/election/permissions.py 中单独定义权限。
+
+2. 初版募选管理权限
+   - 推荐规则：Administrator 或 Manage Guild。
+   - 理由：募选是服务器级管理操作，Manage Guild 足够作为初版管理权限。
+   - 不使用议诉管理身份组，避免“议诉管理员自动变成募选管理员”的过度嵌入。
+   - 不使用监察管理员规则，避免“只有服主/Administrator 能管理募选”过窄。
+
+3. 投票身份组限制
+   - 投票身份组限制是募选初版需求，不放到二期。
+   - 每场募选可配置 allowed_voter_role_ids。
+   - 如果 allowed_voter_role_ids 为空：所有服务器成员可投票。
+   - 如果配置了多个身份组：用户拥有其中任意一个即可投票。
+   - 这是 OR 规则，不要求同时拥有所有身份组。
+
+4. 可选二期扩展 pe_settings
+   - 如果未来需要更细权限，可新增 pe_settings 或 pe_guild_settings。
+   - 可配置：
+     - election_admin_role_ids：募选管理员身份组。
+     - registration_role_ids：允许报名身份组。
+     - default_voting_role_ids：默认允许投票身份组。
+     - alert_channel_id：默认告警频道。
+   - 若配置 election_admin_role_ids，则管理员规则可变为：
+     - Administrator 永远允许。
+     - 拥有 election_admin_role_ids 之一允许。
+     - 是否保留 Manage Guild 兜底需要另行确认。
+
+5. 募选普通用户权限
+   - 报名：默认所有服务器成员可报名。
+   - 投票：按本场募选 allowed_voter_role_ids 判断。
+     - 未配置时所有服务器成员可投票。
+     - 配置时拥有任意一个允许身份组即可投票。
+   - 后续若配置 registration_role_ids，再按身份组限制报名。
+
+6. 募选命令权限建议
+
+   管理命令，需要 Administrator 或 Manage Guild：
+   - /募选 创建
+   - /募选 设置入口
+   - /募选 候选人
+   - /募选 同步公示
+   - /募选 开始投票
+   - /募选 结束并计票
+   - /募选 重算结果
+   - /募选 清除投票
+   - /募选 取消
+   - /募选 审计
+
+   可普通成员使用：
+   - /募选 我的报名
+   - /募选 帮助
+   - 报名入口按钮：报名、我的报名、编辑报名、撤回报名。
+   - 投票入口按钮：开始投票。
+
+   可公开或半公开查看：
+   - /募选 列表
+   - /募选 状态
+
+   状态/列表的隐私规则：
+   - realtime 模式：可显示报名人数和有效候选人数。
+   - batch 模式报名期内：普通用户不显示报名人数、候选人数、候选人名单等可能泄露报名情况的信息。
+   - 管理员使用 /募选 状态 可看到完整统计，但应 ephemeral。
+
+6. 告警权限和可见性
+   - 统一公示失败、自动进投票受阻、自动计票失败等告警应发到 alert_channel_id。
+   - alert_channel_id 应由管理员在创建募选时指定或由 pe_settings 默认提供。
+   - 如果没有告警频道，Bot 应尝试 DM 创建者，并写入 pe_audit_logs。
+   - 告警消息不应公开候选人的完整自我介绍，避免 batch 模式泄密。
+
+D. 三模块鉴权边界结论
+
+1. 议诉 court
+   - 使用 guild_settings.admin_role_ids + Administrator 兜底。
+   - 初始化时使用 Administrator / Manage Guild。
+
+2. 监察 inspection
+   - 使用服务器所有者 / Administrator。
+   - 不吃议诉 admin_role_ids。
+   - Manage Guild 不算监察管理员。
+
+3. 募选 election
+   - 初版使用 Administrator / Manage Guild。
+   - 不吃议诉 admin_role_ids。
+   - 不吃监察管理员规则。
+   - 后续如需身份组权限，新增 pe_settings 独立配置。
+
+4. 总原则
+   - 三个模块可以共用 bot 加载、数据库基础连接、命令本地化、Discord View 模式。
+   - 三个模块的业务鉴权不要互相隐式继承。
+   - 如果要做统一权限中心，应另行设计全局权限系统，而不是让某个业务模块的设置支配其他模块。
+
+
+16. 频道权限检查
+    - 创建时应检查 Bot 对报名、投票、公示频道至少具备：
+      - View Channel。
+      - Send Messages。
+      - Embed Links。
+      - Read Message History。
+    - 如果需要编辑旧消息，Read Message History 很重要。
+
+D. 推荐实现边界结论
+
+1. 可以复用基础设施，不复用业务模型。
+2. ElectionCog 作为独立扩展加载。
+3. ElectionRepo 独立建表、独立 schema、独立审计日志。
+4. permissions.py 独立定义募选权限。
+5. time_utils.py 独立处理北京时间和持续时间解析。
+6. publicity_service.py 独立处理所有公示发送、编辑、同步和失败恢复。
+7. vote_service.py 独立处理统一投票，不调用监察投票服务。
+8. result_service.py 独立处理字段顺序、同票报名时间优先、不补位等算法。

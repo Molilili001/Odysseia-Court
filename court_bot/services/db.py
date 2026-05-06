@@ -155,7 +155,8 @@ CREATE TABLE IF NOT EXISTS turn_state (
   case_id INTEGER PRIMARY KEY,
   channel_id INTEGER NOT NULL,
   speaker_id INTEGER NOT NULL,
-  expires_at TEXT NOT NULL,
+  -- 旧字段：曾用于发言超时；现保留兼容旧库，不再作为结束条件。
+  expires_at TEXT,
   msg_count INTEGER NOT NULL DEFAULT 0,
   msg_limit INTEGER NOT NULL DEFAULT 10,
   created_at TEXT NOT NULL,
@@ -588,7 +589,7 @@ class CaseRepo:
         case_id: int,
         channel_id: int,
         speaker_id: int,
-        expires_at: str,
+        expires_at: str | None = None,
         msg_count: int = 0,
         msg_limit: int = 10,
     ) -> None:
@@ -605,7 +606,7 @@ class CaseRepo:
               msg_limit=excluded.msg_limit,
               updated_at=excluded.updated_at
             """,
-            (case_id, channel_id, speaker_id, expires_at, msg_count, msg_limit, now, now),
+            (case_id, channel_id, speaker_id, expires_at or "", msg_count, msg_limit, now, now),
         )
 
     async def increment_turn_msg_count(self, case_id: int, *, delta: int = 1) -> Optional[int]:
@@ -624,14 +625,6 @@ class CaseRepo:
 
     async def clear_turn_state(self, case_id: int) -> None:
         await self.db.execute_close("DELETE FROM turn_state WHERE case_id=?", (case_id,))
-
-    async def list_expired_turn_states(self, *, now_iso: str | None = None) -> list[dict]:
-        now = now_iso or utc_now_iso()
-        rows = await self.db.fetchall(
-            "SELECT * FROM turn_state WHERE expires_at <= ? ORDER BY expires_at ASC",
-            (now,),
-        )
-        return [dict(r) for r in rows]
 
 
 

@@ -1,0 +1,88 @@
+from __future__ import annotations
+
+# Modes
+VOTE_MODE_UNIFIED = "unified"
+PUBLICITY_REALTIME = "realtime"
+PUBLICITY_BATCH = "batch"
+
+# Election status
+STATUS_SETUP = "setup"
+STATUS_REGISTRATION = "registration"
+STATUS_REGISTRATION_ENDED = "registration_ended"
+STATUS_VOTING = "voting"
+STATUS_COMPLETED = "completed"
+STATUS_CANCELLED = "cancelled"
+
+ACTIVE_ELECTION_STATUSES = (
+    STATUS_SETUP,
+    STATUS_REGISTRATION,
+    STATUS_REGISTRATION_ENDED,
+    STATUS_VOTING,
+)
+
+# Registration status
+REG_ACTIVE = "active"
+REG_WITHDRAWN = "withdrawn"
+REG_REJECTED = "rejected"
+REG_REVOKED = "revoked"
+
+# Public sync status
+PUBLIC_NOT_PUBLISHED = "not_published"
+PUBLIC_PENDING = "pending"
+PUBLIC_SYNCED = "synced"
+PUBLIC_FAILED = "failed"
+
+# Batch publicity status
+BATCH_NOT_REQUIRED = "not_required"
+BATCH_PENDING = "pending"
+BATCH_PUBLISHING = "publishing"
+BATCH_PARTIAL_FAILED = "partial_failed"
+BATCH_COMPLETED = "completed"
+
+# Command / component defaults
+CUSTOM_ID_PREFIX = "pe:"
+REGISTRATION_VIEW_PREFIX = f"{CUSTOM_ID_PREFIX}reg:"
+VOTE_VIEW_PREFIX = f"{CUSTOM_ID_PREFIX}vote:"
+
+MAX_FIELDS = 25
+MAX_SELF_INTRO_LENGTH = 1000
+MAX_DURATION_MINUTES = 30 * 24 * 60
+SCHEDULER_INTERVAL_SECONDS = 60
+
+BEIJING_TZ = "Asia/Shanghai"
+
+COLOR_BLUE = 0x3498DB
+COLOR_RED = 0xE74C3C
+COLOR_GOLD = 0xF1C40F
+COLOR_YELLOW = COLOR_GOLD
+COLOR_GREEN = 0x2ECC71
+COLOR_GRAY = 0x95A5A6
+COLOR_ORANGE = 0xE67E22
+
+STATUS_LABELS = {
+    STATUS_SETUP: "未开始",
+    STATUS_REGISTRATION: "报名中",
+    STATUS_REGISTRATION_ENDED: "报名结束/公示期",
+    STATUS_VOTING: "投票中",
+    STATUS_COMPLETED: "已完成",
+    STATUS_CANCELLED: "已取消",
+}
+
+REGISTRATION_STATUS_LABELS = {
+    REG_ACTIVE: "有效报名",
+    REG_WITHDRAWN: "已撤回",
+    REG_REJECTED: "已打回",
+    REG_REVOKED: "已撤销",
+}
+
+PUBLICITY_LABELS = {
+    PUBLICITY_REALTIME: "实时公示",
+    PUBLICITY_BATCH: "报名结束后统一公示",
+}
+
+PUBLIC_SYNC_STATUS_LABELS = {
+    PUBLIC_NOT_PUBLISHED: "未公示",
+    PUBLIC_PENDING: "等待同步",
+    PUBLIC_SYNCED: "已公示",
+    PUBLIC_FAILED: "公示失败",
+}

@@ -114,6 +114,7 @@ class ArchiveBuildResult:
 
 def _build_html(
     *,
+    archive_title: str,
     header_html: str,
     message_blocks: Iterable[str],
 ) -> str:
@@ -162,7 +163,7 @@ def _build_html(
 <head>
   <meta charset='utf-8'>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <title>议诉归档</title>
+  <title>{html_escape.escape(archive_title)}</title>
   <style>{css}</style>
 </head>
 <body>
@@ -185,6 +186,7 @@ async def build_archive(
     guild_filesize_limit: int,
     media_budget_bytes: int | None = None,
     single_image_max_bytes: int | None = None,
+    archive_title: str = "议诉归档",
 ) -> ArchiveBuildResult:
     """导出频道为 DCE 风格 HTML（优先单文件，超限则 ZIP）。
 
@@ -479,7 +481,7 @@ async def build_archive(
             )
         return blocks
 
-    header_html = "<h1>📌 议诉归档</h1>" + "<div class='meta'>" + html_escape.escape("\n".join(header_lines)) + "</div>"
+    header_html = f"<h1>📌 {html_escape.escape(archive_title)}</h1>" + "<div class='meta'>" + html_escape.escape("\n".join(header_lines)) + "</div>"
 
     # 优先：单文件 HTML（base64 内嵌图片）。但 base64 会额外膨胀约 33%，
     # 如果明显超过上传限制，就跳过这一步，避免在小内存 VPS 上制造无意义峰值。
@@ -494,6 +496,7 @@ async def build_archive(
             avatar_src_inline[key] = _safe_bytes_to_data_url(mime, data)
 
         html_inline = _build_html(
+            archive_title=archive_title,
             header_html=header_html,
             message_blocks=build_message_blocks(image_src=image_src_inline, avatar_src=avatar_src_inline),
         )
@@ -508,13 +511,18 @@ async def build_archive(
 
     if offline_bytes_used > limit and (images or avatars):
         warnings.append("离线资源体积超过上传限制：已跳过 ZIP 打包，仅保留 CDN/原始链接。")
-        html_urls = _build_html(header_html=header_html, message_blocks=build_message_blocks(image_src={}, avatar_src={}))
+        html_urls = _build_html(
+            archive_title=archive_title,
+            header_html=header_html,
+            message_blocks=build_message_blocks(image_src={}, avatar_src={}),
+        )
         return ArchiveBuildResult(mode="html", filename=f"archive-{channel.id}-urls.html", data=html_urls.encode("utf-8"), warnings=warnings)
 
     # 超限：ZIP（index.html + assets）
     image_src_assets: dict[str, str] = {key: f"assets/{key}" for key, _, _ in images}
     avatar_src_assets: dict[str, str] = {key: f"assets/avatars/{key}" for key, _, _ in avatars}
     html_assets = _build_html(
+        archive_title=archive_title,
         header_html=header_html,
         message_blocks=build_message_blocks(image_src=image_src_assets, avatar_src=avatar_src_assets),
     )
@@ -533,5 +541,9 @@ async def build_archive(
 
     # 仍超限：降级（不内嵌、不打包图片，仅保留 URL）
     warnings.append("归档文件过大：已降级为仅记录图片 URL（未离线保存）。")
-    html_urls = _build_html(header_html=header_html, message_blocks=build_message_blocks(image_src={}, avatar_src={}))
+    html_urls = _build_html(
+        archive_title=archive_title,
+        header_html=header_html,
+        message_blocks=build_message_blocks(image_src={}, avatar_src={}),
+    )
     return ArchiveBuildResult(mode="html", filename=f"archive-{channel.id}-urls.html", data=html_urls.encode("utf-8"), warnings=warnings)

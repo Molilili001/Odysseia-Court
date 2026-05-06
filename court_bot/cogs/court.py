@@ -393,12 +393,13 @@ class CourtCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-        # 若设置了 COMMAND_GUILD_ID，则只注册为该 Guild 的命令（更新更快）。
-        # 同时在启动阶段会把“全局命令列表同步为空”，用于清理旧的全局英文指令，避免出现两组指令。
+        # 若设置了 COMMAND_GUILD_IDS/COMMAND_GUILD_ID，则只注册为这些 Guild 的命令（更新更快）。
+        # 同时在启动阶段会把“全局命令列表同步为空”，用于清理旧的全局指令，避免出现两组指令。
         self.group = CourtGroup(bot)
-        if getattr(bot, "config", None) and bot.config.command_guild_id:
-            guild = discord.Object(id=bot.config.command_guild_id)
-            bot.tree.add_command(self.group, guild=guild)
+        command_guild_ids = getattr(getattr(bot, "config", None), "command_guild_ids", ())
+        if command_guild_ids:
+            guilds = [discord.Object(id=guild_id) for guild_id in command_guild_ids]
+            bot.tree.add_command(self.group, guilds=guilds)
         else:
             bot.tree.add_command(self.group)
 
