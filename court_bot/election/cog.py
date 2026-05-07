@@ -16,6 +16,9 @@ from .constants import (
     MAX_SELF_INTRO_LENGTH,
     PUBLICITY_BATCH,
     PUBLICITY_REALTIME,
+    REG_COUNT_DISPLAY_DETAIL,
+    REG_COUNT_DISPLAY_HIDDEN,
+    REG_COUNT_DISPLAY_TOTAL,
     PUBLIC_SYNC_STATUS_LABELS,
     REGISTRATION_STATUS_LABELS,
     REG_REVOKED,
@@ -31,6 +34,7 @@ from .database import ElectionRepo
 from .embeds import (
     build_election_list_embed,
     build_help_embeds,
+    build_registration_count_text,
     build_registration_entry_embed,
     build_status_embed,
 )
@@ -164,6 +168,7 @@ class ElectionGroup(app_commands.Group):
         alert_channel=locale_str("alert_channel", zh_CN="告警频道", zh_TW="告警頻道", en_US="告警频道", en_GB="告警频道"),
         start_at=locale_str("start_at", zh_CN="报名开始时间", zh_TW="報名開始時間", en_US="报名开始时间", en_GB="报名开始时间"),
         send_entry=locale_str("send_entry", zh_CN="立即发送入口", zh_TW="立即發送入口", en_US="立即发送入口", en_GB="立即发送入口"),
+        registration_count_display=locale_str("registration_count_display", zh_CN="报名人数显示", zh_TW="報名人數顯示", en_US="报名人数显示", en_GB="报名人数显示"),
     )
     @app_commands.describe(
         name="募选名称，对外展示在报名入口、公示、投票和结果中",
@@ -181,8 +186,12 @@ class ElectionGroup(app_commands.Group):
         alert_channel="公示失败、流程异常等告警频道；不填则优先使用公示频道",
         start_at="北京时间 YYYY-MM-DD HH:mm；不填为立即开始",
         send_entry="是否在创建后立即发送报名入口",
+        registration_count_display="报名入口是否公开当前报名人数；不填默认不显示",
     )
-    @app_commands.choices(publicity_mode=[Choice(name="实时公示", value=PUBLICITY_REALTIME), Choice(name="报名结束后统一公示", value=PUBLICITY_BATCH)])
+    @app_commands.choices(
+        publicity_mode=[Choice(name="实时公示", value=PUBLICITY_REALTIME), Choice(name="报名结束后统一公示", value=PUBLICITY_BATCH)],
+        registration_count_display=[Choice(name="只显示总人数", value=REG_COUNT_DISPLAY_TOTAL), Choice(name="详细显示", value=REG_COUNT_DISPLAY_DETAIL)],
+    )
     async def create(
         self,
         interaction: discord.Interaction,
@@ -201,6 +210,7 @@ class ElectionGroup(app_commands.Group):
         alert_channel: discord.TextChannel | None = None,
         start_at: str | None = None,
         send_entry: bool = True,
+        registration_count_display: Choice[str] | None = None,
     ) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
@@ -253,6 +263,7 @@ class ElectionGroup(app_commands.Group):
                 alert_channel_id=alert_channel.id if alert_channel else None,
                 allowed_candidate_role_ids=candidate_role_ids,
                 allowed_voter_role_ids=role_ids,
+                registration_count_display=registration_count_display.value if registration_count_display else REG_COUNT_DISPLAY_HIDDEN,
                 vote_max_selections=vote_max_selections,
                 registration_duration_minutes=reg_minutes,
                 publicity_duration_minutes=pub_minutes,
@@ -365,6 +376,9 @@ class ElectionGroup(app_commands.Group):
                 raise ValueError("未知操作。")
             await self.cog.publicity.sync_registration_publicity(election, reg, allow_create=bool(reg.get("public_message_id") or election.get("publicity_mode") != PUBLICITY_BATCH or election.get("batch_publicity_status") == BATCH_COMPLETED))
             await self.cog.repo.log(int(election["id"]), interaction.guild.id, interaction.user.id, f"candidate_{operation.value}", {"user_id": user.id, "reason": reason})
+            if str(election.get("registration_count_display") or REG_COUNT_DISPLAY_HIDDEN) != REG_COUNT_DISPLAY_HIDDEN:
+                fresh = await self.cog.repo.get_election(int(election["id"])) or election
+                await self.cog.refresh_registration_entry(fresh, reason=f"candidate_{operation.value}")
             await interaction.edit_original_response(content="操作完成。")
         except Exception as exc:
             await interaction.edit_original_response(content=f"操作失败：{exc}")
@@ -773,8 +787,16 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
         return "\n".join(lines)
 
 
+    async def _registration_count_text(self, election: dict[str, Any], fields: list[dict[str, Any]]) -> str | None:
+        mode = str(election.get("registration_count_display") or REG_COUNT_DISPLAY_HIDDEN)
+        if mode == REG_COUNT_DISPLAY_HIDDEN:
+            return None
+        registrations = await self.repo.list_active_registrations(int(election["id"]))
+        return build_registration_count_text(fields, registrations, mode=mode)
+
     async def send_registration_entry(self, election: dict, fields: list[dict[str, Any]], *, channel: discord.TextChannel) -> discord.Message:
-        msg = await channel.send(embed=build_registration_entry_embed(election, fields), view=RegistrationEntryView(cog=self), allowed_mentions=discord.AllowedMentions.none())
+        count_text = await self._registration_count_text(election, fields)
+        msg = await channel.send(embed=build_registration_entry_embed(election, fields, registration_count_text=count_text), view=RegistrationEntryView(cog=self), allowed_mentions=discord.AllowedMentions.none())
         await self.repo.set_registration_entry_message(int(election["id"]), int(msg.id), int(channel.id))
         return msg
 
@@ -793,10 +815,11 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
             return False
         fresh = await self.repo.get_election(int(election["id"])) or election
         fields = await self.repo.list_fields(int(fresh["id"]))
+        count_text = await self._registration_count_text(fresh, fields)
         try:
             message = await channel.fetch_message(message_id)
             await message.edit(
-                embed=build_registration_entry_embed(fresh, fields),
+                embed=build_registration_entry_embed(fresh, fields, registration_count_text=count_text),
                 view=RegistrationEntryView(cog=self),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -869,6 +892,9 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
         if election.get("publicity_mode") == PUBLICITY_REALTIME:
             await self.publicity.sync_registration_publicity(election, reg, allow_create=True)
         await self.repo.log(election_id, interaction.guild.id, interaction.user.id, "registration_submitted", {"fields": selected_field_keys, "is_edit": is_edit})
+        if str(election.get("registration_count_display") or REG_COUNT_DISPLAY_HIDDEN) != REG_COUNT_DISPLAY_HIDDEN:
+            fresh = await self.repo.get_election(election_id) or election
+            await self.refresh_registration_entry(fresh, reason="registration_submitted")
         await interaction.edit_original_response(content="报名已保存。" + ("实时公示已同步。" if election.get("publicity_mode") == PUBLICITY_REALTIME else "本场为统一公示模式，报名期内不会公开你的报名。"))
 
     async def show_my_registration(self, interaction: discord.Interaction, election_id: int | None = None) -> None:
@@ -915,6 +941,9 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
         reg = await self.repo.set_registration_status(election_id=int(election["id"]), user_id=interaction.user.id, status=REG_WITHDRAWN, reason="用户撤回", operator_id=interaction.user.id)
         if election.get("publicity_mode") == PUBLICITY_REALTIME or reg.get("public_message_id"):
             await self.publicity.sync_registration_publicity(election, reg, allow_create=False)
+        if str(election.get("registration_count_display") or REG_COUNT_DISPLAY_HIDDEN) != REG_COUNT_DISPLAY_HIDDEN:
+            fresh = await self.repo.get_election(int(election["id"])) or election
+            await self.refresh_registration_entry(fresh, reason="registration_withdrawn")
         await interaction.response.send_message("已撤回报名。若在报名期内重新报名，将刷新报名时间。", ephemeral=True)
 
     async def start_vote_interaction(self, interaction: discord.Interaction) -> None:

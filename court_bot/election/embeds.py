@@ -17,6 +17,9 @@ from .constants import (
     PUBLIC_SYNC_STATUS_LABELS,
     REGISTRATION_STATUS_LABELS,
     REG_ACTIVE,
+    REG_COUNT_DISPLAY_DETAIL,
+    REG_COUNT_DISPLAY_HIDDEN,
+    REG_COUNT_DISPLAY_TOTAL,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_LABELS,
@@ -39,6 +42,35 @@ def _field_lines(fields: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def build_registration_count_text(fields: list[dict[str, Any]], registrations: list[dict[str, Any]], *, mode: str) -> str | None:
+    mode = str(mode or REG_COUNT_DISPLAY_HIDDEN)
+    if mode not in (REG_COUNT_DISPLAY_TOTAL, REG_COUNT_DISPLAY_DETAIL):
+        return None
+
+    total = len(registrations)
+    if mode == REG_COUNT_DISPLAY_TOTAL:
+        return f"总人数：{total} 人"
+
+    field_keys = [str(field["field_key"]) for field in fields]
+    field_key_set = set(field_keys)
+    field_counts = {field_key: 0 for field_key in field_keys}
+    all_fields_count = 0
+
+    for registration in registrations:
+        selected_keys = set(ElectionRepo.decode_field_keys(registration.get("selected_field_keys"))) & field_key_set
+        is_all_fields = bool(field_key_set) and field_key_set.issubset(selected_keys)
+        if is_all_fields:
+            all_fields_count += 1
+        for field_key in ([] if is_all_fields else selected_keys):
+            field_counts[field_key] = field_counts.get(field_key, 0) + 1
+
+    lines = [f"总人数：{total} 人"]
+    for field in fields:
+        lines.append(f"{sanitize_public_text(field.get('name'), max_len=24)}：{field_counts.get(str(field['field_key']), 0)} 人")
+    lines.append(f"全选（全部岗位）：{all_fields_count} 人")
+    return "\n".join(lines)[:1024]
+
+
 def _registration_entry_hint(status: str) -> str:
     if status == STATUS_SETUP:
         return "募选尚未开始，报名按钮暂不可用；开始后入口会自动刷新。"
@@ -55,7 +87,7 @@ def _registration_entry_hint(status: str) -> str:
     return "请根据当前状态使用下方按钮。"
 
 
-def build_registration_entry_embed(election: dict[str, Any], fields: list[dict[str, Any]]) -> discord.Embed:
+def build_registration_entry_embed(election: dict[str, Any], fields: list[dict[str, Any]], *, registration_count_text: str | None = None) -> discord.Embed:
     status = str(election.get("status") or "")
     embed = discord.Embed(
         title=f"募选报名入口｜{sanitize_public_text(election['name'], max_len=120)}",
@@ -68,6 +100,8 @@ def build_registration_entry_embed(election: dict[str, Any], fields: list[dict[s
     allowed_candidate_roles = ElectionRepo.decode_role_ids(election.get("allowed_candidate_role_ids"))
     embed.add_field(name="报名资格", value=format_role_mentions(allowed_candidate_roles, action="报名")[:1024], inline=False)
     embed.add_field(name="岗位/人数", value=_field_lines(fields)[:1024], inline=False)
+    if registration_count_text:
+        embed.add_field(name="当前报名人数", value=registration_count_text[:1024], inline=False)
     embed.add_field(name="报名开始", value=format_time_pair(election.get("registration_start_at")), inline=False)
     embed.add_field(name="报名结束", value=format_time_pair(election.get("registration_end_at")), inline=False)
     embed.add_field(name="投票开始", value=format_time_pair(election.get("voting_start_at")), inline=False)

@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS pe_elections (
   vote_id INTEGER,
   vote_max_selections INTEGER NOT NULL,
   alert_channel_id INTEGER,
+  registration_count_display TEXT NOT NULL DEFAULT 'hidden',
   batch_publicity_status TEXT NOT NULL DEFAULT 'not_required',
   batch_publicity_error TEXT,
   schedule_timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
@@ -198,6 +199,7 @@ class ElectionRepo:
             "ALTER TABLE pe_elections ADD COLUMN allowed_voter_role_ids TEXT",
             "ALTER TABLE pe_elections ADD COLUMN registration_entry_channel_id INTEGER",
             "ALTER TABLE pe_elections ADD COLUMN alert_channel_id INTEGER",
+            "ALTER TABLE pe_elections ADD COLUMN registration_count_display TEXT NOT NULL DEFAULT 'hidden'",
             "ALTER TABLE pe_elections ADD COLUMN batch_publicity_status TEXT NOT NULL DEFAULT 'not_required'",
             "ALTER TABLE pe_elections ADD COLUMN batch_publicity_error TEXT",
             "ALTER TABLE pe_elections ADD COLUMN schedule_timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai'",
@@ -255,6 +257,7 @@ class ElectionRepo:
         voting_end_at: str,
         created_by: int,
         fields: list[tuple[str, int]],
+        registration_count_display: str = "hidden",
         initial_status: str = STATUS_SETUP,
     ) -> int:
         now = utc_now_iso()
@@ -269,12 +272,12 @@ class ElectionRepo:
                     INSERT INTO pe_elections(
                       guild_id, name, status, vote_mode, publicity_mode,
                       registration_channel_id, voting_channel_id, public_channel_id,
-                      allowed_candidate_role_ids, allowed_voter_role_ids, vote_max_selections, alert_channel_id,
+                      allowed_candidate_role_ids, allowed_voter_role_ids, vote_max_selections, alert_channel_id, registration_count_display,
                       batch_publicity_status, schedule_timezone,
                       registration_duration_minutes, publicity_duration_minutes, voting_duration_minutes,
                       registration_start_at, registration_end_at, voting_start_at, voting_end_at,
                       created_by, created_at, updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         int(guild_id),
@@ -289,6 +292,7 @@ class ElectionRepo:
                         _json_dumps([int(x) for x in allowed_voter_role_ids]),
                         int(vote_max_selections),
                         int(alert_channel_id) if alert_channel_id else None,
+                        str(registration_count_display or "hidden"),
                         batch_status,
                         "Asia/Shanghai",
                         int(registration_duration_minutes),

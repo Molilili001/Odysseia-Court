@@ -5,8 +5,23 @@ from typing import Any
 
 import discord
 
-from .constants import CUSTOM_ID_PREFIX, MAX_SELF_INTRO_LENGTH
+from .constants import CUSTOM_ID_PREFIX, MAX_SELF_INTRO_LENGTH, REGISTRATION_SELECT_ALL_VALUE
 from .embeds import build_vote_confirm_embed, build_vote_page_embed
+
+
+def resolve_registration_selected_field_keys(fields: list[dict[str, Any]], selected_values: list[str]) -> list[str]:
+    """Resolve the field keys selected from the registration select menus.
+
+    Discord select menus can contain at most 25 options. When there are already
+    25 election fields, the "全选" shortcut is rendered as a separate select, but
+    both paths should produce the same normalized field-key list.
+    """
+
+    field_keys = [str(field["field_key"]) for field in fields]
+    if REGISTRATION_SELECT_ALL_VALUE in selected_values:
+        return field_keys
+    valid_keys = set(field_keys)
+    return list(dict.fromkeys(str(value) for value in selected_values if str(value) in valid_keys))
 
 
 class RegistrationIntroModal(discord.ui.Modal):
@@ -40,18 +55,46 @@ class FieldSelectView(discord.ui.View):
         self.cog = cog
         self.election = election
         self.is_edit = is_edit
+        self.fields = list(fields)
+
+        all_option = discord.SelectOption(
+            label="全选",
+            value=REGISTRATION_SELECT_ALL_VALUE,
+            description="报名参选所有岗位",
+        )
+        field_options = [
+            discord.SelectOption(
+                label=str(field["name"])[:100],
+                value=str(field["field_key"]),
+                description=f"当选人数：{int(field['winner_count'])}"[:100],
+            )
+            for field in self.fields[:25]
+        ]
+
+        # A single Discord select can only have 25 options. For <=24 fields, put
+        # "全选" in the same menu. For 25 fields, keep all 25 individual fields in
+        # the normal menu and render "全选" as a separate shortcut select so the
+        # last field is not hidden.
+        if len(self.fields) <= 24:
+            options = [all_option, *field_options]
+            placeholder = "选择你愿意参选的岗位（可多选）"
+        else:
+            all_select = discord.ui.Select(
+                placeholder="快捷选择",
+                min_values=1,
+                max_values=1,
+                options=[all_option],
+            )
+            all_select.callback = self._on_select
+            self.add_item(all_select)
+            options = field_options
+            placeholder = "选择你愿意参选的岗位（可多选）"
+
         self.select = discord.ui.Select(
-            placeholder="选择你愿意参选的岗位（可多选）",
+            placeholder=placeholder,
             min_values=1,
-            max_values=max(1, min(25, len(fields))),
-            options=[
-                discord.SelectOption(
-                    label=str(field["name"])[:100],
-                    value=str(field["field_key"]),
-                    description=f"当选人数：{int(field['winner_count'])}"[:100],
-                )
-                for field in fields[:25]
-            ],
+            max_values=len(options),
+            options=options,
         )
         self.select.callback = self._on_select
         self.add_item(self.select)
@@ -60,11 +103,16 @@ class FieldSelectView(discord.ui.View):
         if interaction.guild is not None and not await self.cog.can_user_register(interaction.user, self.election):
             await interaction.response.send_message("你没有本次募选报名资格，或报名资格已变更。", ephemeral=True)
             return
+        selected_values = [str(value) for value in interaction.data.get("values", [])] if isinstance(interaction.data, dict) else []
+        selected_field_keys = resolve_registration_selected_field_keys(self.fields, selected_values)
+        if not selected_field_keys:
+            await interaction.response.send_message("请选择至少一个岗位。", ephemeral=True)
+            return
         await interaction.response.send_modal(
             RegistrationIntroModal(
                 cog=self.cog,
                 election_id=int(self.election["id"]),
-                selected_field_keys=list(self.select.values),
+                selected_field_keys=selected_field_keys,
                 is_edit=self.is_edit,
             )
         )

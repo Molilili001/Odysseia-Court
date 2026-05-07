@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 
 from court_bot.election.cog import parse_fields_config, parse_role_ids_from_text
-from court_bot.election.constants import PUBLICITY_REALTIME, REG_WITHDRAWN
+from court_bot.election.constants import PUBLICITY_REALTIME, REG_COUNT_DISPLAY_DETAIL, REG_COUNT_DISPLAY_TOTAL, REG_WITHDRAWN
+from court_bot.election.embeds import build_registration_count_text
 from court_bot.election.permissions import can_register, can_vote
 from court_bot.election.result_service import ResultService
 from court_bot.election.text_utils import contains_forbidden_mention, sanitize_public_text
 from court_bot.election.time_utils import build_schedule, parse_duration_minutes, to_utc_iso
+from court_bot.election.views import FieldSelectView, resolve_registration_selected_field_keys
 from court_bot.services.db import Database
 from court_bot.election.database import ElectionRepo
 
@@ -22,6 +25,17 @@ class FakeRole:
 class FakeMember:
     def __init__(self, role_ids: list[int]):
         self.roles = [FakeRole(role_id) for role_id in role_ids]
+
+
+def make_fields(count: int) -> list[dict]:
+    return [
+        {
+            "field_key": f"field_{idx}",
+            "name": f"岗位{idx}",
+            "winner_count": 1,
+        }
+        for idx in range(1, count + 1)
+    ]
 
 
 class ElectionPureFunctionTests(unittest.TestCase):
@@ -78,6 +92,46 @@ class ElectionPureFunctionTests(unittest.TestCase):
         self.assertTrue(can_register(FakeMember([10, 20]), [20, 30]))
         self.assertFalse(can_register(FakeMember([10, 11]), [20, 30]))
 
+    def test_registration_select_all_resolves_all_fields(self) -> None:
+        fields = make_fields(25)
+        self.assertEqual(
+            resolve_registration_selected_field_keys(fields, ["__all_registration_fields__"]),
+            [f"field_{idx}" for idx in range(1, 26)],
+        )
+        self.assertEqual(
+            resolve_registration_selected_field_keys(fields, ["field_1", "field_3", "field_1", "unknown"]),
+            ["field_1", "field_3"],
+        )
+
+    def test_registration_field_select_keeps_all_25_fields(self) -> None:
+        async def build_view() -> FieldSelectView:
+            return FieldSelectView(cog=object(), election={"id": 1}, fields=make_fields(25))
+
+        view = asyncio.run(build_view())
+        self.assertEqual(len(view.children), 2)
+        shortcut_select = view.children[0]
+        field_select = view.children[1]
+        self.assertEqual([option.label for option in shortcut_select.options], ["全选"])
+        self.assertEqual(len(field_select.options), 25)
+        self.assertEqual(field_select.options[-1].value, "field_25")
+
+    def test_registration_count_text_total_and_detail(self) -> None:
+        fields = make_fields(2)
+        registrations = [
+            {"selected_field_keys": '["field_1"]'},
+            {"selected_field_keys": '["field_2"]'},
+            {"selected_field_keys": '["field_1","field_2"]'},
+        ]
+        self.assertEqual(build_registration_count_text(fields, registrations, mode=REG_COUNT_DISPLAY_TOTAL), "总人数：3 人")
+        detail = build_registration_count_text(fields, registrations, mode=REG_COUNT_DISPLAY_DETAIL)
+        self.assertEqual(
+            detail,
+            "总人数：3 人\n"
+            "岗位1：1 人\n"
+            "岗位2：1 人\n"
+            "全选（全部岗位）：1 人",
+        )
+
 
 class ElectionRepoAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -120,6 +174,7 @@ class ElectionRepoAsyncTests(unittest.IsolatedAsyncioTestCase):
             voting_end_at=to_utc_iso(schedule.voting_end_at),
             created_by=999,
             fields=[("第一岗位", 1), ("第二岗位", 1)],
+            registration_count_display=REG_COUNT_DISPLAY_DETAIL,
         )
         election = await self.repo.get_election(election_id)
         assert election is not None
@@ -127,6 +182,7 @@ class ElectionRepoAsyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_schema_create_registration_reregister_and_vote_immutability(self) -> None:
         election = await self._create_election()
+        self.assertEqual(election.get("registration_count_display"), REG_COUNT_DISPLAY_DETAIL)
         self.assertEqual(ElectionRepo.decode_role_ids(election["allowed_candidate_role_ids"]), [333, 444])
         self.assertEqual(ElectionRepo.decode_role_ids(election["allowed_voter_role_ids"]), [111, 222])
         await self.repo.set_allowed_candidate_role_ids(int(election["id"]), [555, 666])
