@@ -5,7 +5,7 @@ import gc
 import io
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -25,6 +25,8 @@ from .constants import (
     STATUS_UNDER_REVIEW,
     STATUS_WITHDRAWN,
     TURN_MESSAGE_LIMIT,
+    TURN_TIME_LIMIT_MINUTES,
+    TURN_TIME_LIMIT_SECONDS,
     VIS_PRIVATE,
     VIS_PUBLIC,
     round_label,
@@ -65,6 +67,7 @@ class CourtBot(commands.Bot):
 
         self._case_locks: dict[int, asyncio.Lock] = {}
         self._archive_semaphore = asyncio.Semaphore(config.archive_concurrency)
+        self._turn_timeout_tasks: dict[int, asyncio.Task] = {}
 
     # -------------------- 权限/工具方法 --------------------
 
@@ -140,9 +143,141 @@ class CourtBot(commands.Bot):
             self._case_locks[case_id] = lock
         return lock
 
+    @staticmethod
+    def _parse_utc_datetime(value: object) -> datetime | None:
+        if value is None:
+            return None
+
+        raw = str(value).strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+
+        try:
+            dt = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return None
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    @staticmethod
+    def _discord_timestamp(dt: datetime) -> str:
+        ts = int(dt.timestamp())
+        return f"<t:{ts}:R>（<t:{ts}:T>）"
+
+    def _turn_state_expires_at(self, st: dict) -> datetime | None:
+        """返回发言权过期时间。
+
+        新 turn_state 会写入 expires_at；旧运行中的 turn_state 若没有该字段值，则按 created_at + 10 分钟兼容处理。
+        """
+
+        expires_at = self._parse_utc_datetime(st.get("expires_at"))
+        if expires_at is not None:
+            return expires_at
+
+        created_at = self._parse_utc_datetime(st.get("created_at"))
+        if created_at is not None:
+            return created_at + timedelta(seconds=TURN_TIME_LIMIT_SECONDS)
+        return None
+
+    def _turn_state_is_expired(self, st: dict, *, now: datetime | None = None) -> bool:
+        expires_at = self._turn_state_expires_at(st)
+        if expires_at is None:
+            return False
+        return (now or datetime.now(timezone.utc)) >= expires_at
+
+    def _cancel_turn_timeout_task(self, case_id: int) -> None:
+        task = self._turn_timeout_tasks.pop(int(case_id), None)
+        if task is None or task.done():
+            return
+
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if task is current_task:
+            return
+
+        task.cancel()
+
+    def _on_turn_timeout_task_done(self, case_id: int, task: asyncio.Task) -> None:
+        if self._turn_timeout_tasks.get(int(case_id)) is task:
+            self._turn_timeout_tasks.pop(int(case_id), None)
+
+        if task.cancelled():
+            return
+
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+
+        if exc is not None:
+            log.error("Turn timeout task failed for case %s", case_id, exc_info=(type(exc), exc, exc.__traceback__))
+
+    def _schedule_turn_timeout_task(self, *, case_id: int, expires_at: str) -> None:
+        case_id = int(case_id)
+        self._cancel_turn_timeout_task(case_id)
+
+        task = asyncio.create_task(
+            self._turn_timeout_worker(case_id=case_id, expected_expires_at=expires_at or ""),
+            name=f"court-turn-timeout-{case_id}",
+        )
+        self._turn_timeout_tasks[case_id] = task
+        task.add_done_callback(lambda done_task, cid=case_id: self._on_turn_timeout_task_done(cid, done_task))
+
+    async def _turn_timeout_worker(self, *, case_id: int, expected_expires_at: str) -> None:
+        await self.wait_until_ready()
+
+        expires_at = self._parse_utc_datetime(expected_expires_at)
+        if expires_at is None:
+            st = await self.repo.get_turn_state(case_id)
+            if not st:
+                return
+            if str(st.get("expires_at") or "") != (expected_expires_at or ""):
+                return
+            expires_at = self._turn_state_expires_at(st)
+            if expires_at is None:
+                return
+
+        delay = (expires_at - datetime.now(timezone.utc)).total_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        async with self._case_lock(case_id):
+            st = await self.repo.get_turn_state(case_id)
+            if not st:
+                return
+            if str(st.get("expires_at") or "") != (expected_expires_at or ""):
+                return
+            if not self._turn_state_is_expired(st):
+                return
+
+            await self._end_speaking_turn_impl(
+                case_id=case_id,
+                operator=None,
+                reason=f"达到 {TURN_TIME_LIMIT_MINUTES} 分钟时间限制自动结束",
+            )
+
+    async def restore_turn_timeout_tasks(self) -> None:
+        states = await self.repo.list_turn_states()
+        restored = 0
+        for st in states:
+            if self._turn_state_expires_at(st) is None:
+                continue
+            self._schedule_turn_timeout_task(case_id=int(st["case_id"]), expires_at=str(st.get("expires_at") or ""))
+            restored += 1
+
+        if restored:
+            log.info("Restored turn timeout tasks: %s active turn(s)", restored)
+
     def forget_case_runtime_state(self, case_id: int) -> None:
         """释放已结束议诉的进程内临时状态，避免长期运行时小对象累积。"""
 
+        self._cancel_turn_timeout_task(int(case_id))
         lock = self._case_locks.get(int(case_id))
         if lock is not None and not lock.locked():
             self._case_locks.pop(int(case_id), None)
@@ -233,6 +368,9 @@ class CourtBot(commands.Bot):
         # 恢复 persistent views
         await self.restore_persistent_views()
 
+        # 恢复运行中的发言超时任务（用于重启后继续执行每轮 10 分钟限制）
+        await self.restore_turn_timeout_tasks()
+
         # 同步指令
         #
         # Discord 的应用指令分为两类：
@@ -266,6 +404,11 @@ class CourtBot(commands.Bot):
                 log.exception("Failed to sync commands globally")
 
     async def close(self) -> None:
+        for task in list(self._turn_timeout_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._turn_timeout_tasks.clear()
+
         await super().close()
         await self.db.close()
 
@@ -276,7 +419,7 @@ class CourtBot(commands.Bot):
         """议诉频道纪律兜底。
 
         - 非当前发言者（且非管理）发言将被删除
-        - 当前发言者发言计数，达到上限自动结束本轮
+        - 当前发言者发言计数，达到条数或时间上限自动结束本轮
         """
 
         try:
@@ -310,6 +453,27 @@ class CourtBot(commands.Bot):
                 return
 
             speaker_id = int(st.get("speaker_id") or 0)
+
+            # 发言权已过期：先结束本轮；过期后发出的当事人消息不计入有效发言。
+            if self._turn_state_is_expired(st):
+                should_delete = message.author.id == speaker_id
+                if not should_delete and not await self.is_admin(message.author, message.guild):
+                    should_delete = True
+                if should_delete:
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                try:
+                    await self.end_speaking_turn(
+                        case_id=int(case["id"]),
+                        operator=None,
+                        reason=f"达到 {TURN_TIME_LIMIT_MINUTES} 分钟时间限制自动结束",
+                    )
+                except Exception:
+                    log.exception("Failed to auto-end timed out turn (case %s)", case.get("id"))
+                return
+
             if message.author.id == speaker_id:
                 # 当前发言者：计数（即便是管理也计数，避免“测试时不生效”）
                 new_count = await self.repo.increment_turn_msg_count(int(case["id"]), delta=1)
@@ -633,7 +797,7 @@ class CourtBot(commands.Bot):
             return await self._begin_speaking_turn_impl(case_id=case_id, speaker=speaker)
 
     async def _begin_speaking_turn_impl(self, *, case_id: int, speaker: discord.Member) -> dict:
-        """授予当前应发言方本轮发言权（仅限制 10 条消息，不设时间限制）。
+        """授予当前应发言方本轮发言权（最多 10 条消息，限时 10 分钟）。
 
         - 写入 turn_state
         - 临时开启该成员的 send_messages/attach_files
@@ -660,10 +824,13 @@ class CourtBot(commands.Bot):
         if not isinstance(space, discord.TextChannel):
             raise RuntimeError("无法找到议诉频道")
 
+        expires_at_dt = datetime.now(timezone.utc) + timedelta(seconds=TURN_TIME_LIMIT_SECONDS)
+        expires_at = expires_at_dt.isoformat()
         await self.repo.upsert_turn_state(
             case_id=case_id,
             channel_id=space.id,
             speaker_id=speaker.id,
+            expires_at=expires_at,
             msg_count=0,
             msg_limit=TURN_MESSAGE_LIMIT,
         )
@@ -686,6 +853,8 @@ class CourtBot(commands.Bot):
             await self.repo.clear_turn_state(case_id)
             raise RuntimeError(f"设置发言权限失败：{e}")
 
+        self._schedule_turn_timeout_task(case_id=case_id, expires_at=expires_at)
+
         who = "投诉人" if current_side == SIDE_COMPLAINANT else "被投诉人"
         r = int(case.get("current_round") or 1)
         await space.send(
@@ -694,7 +863,7 @@ class CourtBot(commands.Bot):
                 description=(
                     f"发言者：{speaker.mention}\n"
                     f"条数上限：{TURN_MESSAGE_LIMIT} 条\n"
-                    "时间限制：无\n\n"
+                    f"时间限制：{TURN_TIME_LIMIT_MINUTES} 分钟，截止 {self._discord_timestamp(expires_at_dt)}\n\n"
                     "请直接在本频道发送文字/图片/文件；发完点击面板『结束本轮发言』。"
                 ),
                 color=0x5865F2,
@@ -705,7 +874,13 @@ class CourtBot(commands.Bot):
             case_id,
             "turn_started",
             speaker.id,
-            {"round": r, "side": current_side, "msg_limit": TURN_MESSAGE_LIMIT},
+            {
+                "round": r,
+                "side": current_side,
+                "msg_limit": TURN_MESSAGE_LIMIT,
+                "time_limit_seconds": TURN_TIME_LIMIT_SECONDS,
+                "expires_at": expires_at,
+            },
         )
 
         return await self.repo.get_turn_state(case_id) or {}
@@ -720,6 +895,7 @@ class CourtBot(commands.Bot):
         可用于：
         - 发言者点击结束
         - 达到条数上限自动结束
+        - 达到时间上限自动结束
         - 管理强制结束
         """
 
@@ -730,16 +906,19 @@ class CourtBot(commands.Bot):
         if case.get("status") != STATUS_IN_SESSION:
             # 若议诉已不在进行中，理论上不应存在 turn_state；这里做防御性清理。
             await self.repo.clear_turn_state(case_id)
+            self._cancel_turn_timeout_task(case_id)
             return case
 
         st = await self.repo.get_turn_state(case_id)
         if not st:
             # 无进行中的回合：返回当前 case
+            self._cancel_turn_timeout_task(case_id)
             return case
 
         space = await self.get_case_space(case)
         if not isinstance(space, discord.TextChannel):
             await self.repo.clear_turn_state(case_id)
+            self._cancel_turn_timeout_task(case_id)
             raise RuntimeError("无法找到议诉频道")
 
         speaker_id = int(st.get("speaker_id") or 0)
@@ -769,6 +948,7 @@ class CourtBot(commands.Bot):
                 pass
 
         await self.repo.clear_turn_state(case_id)
+        self._cancel_turn_timeout_task(case_id)
 
         updated_case = await self.repo.advance_turn(case_id)
         await self.refresh_court_panel(updated_case)

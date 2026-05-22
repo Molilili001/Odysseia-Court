@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS turn_state (
   case_id INTEGER PRIMARY KEY,
   channel_id INTEGER NOT NULL,
   speaker_id INTEGER NOT NULL,
-  -- 旧字段：曾用于发言超时；现保留兼容旧库，不再作为结束条件。
+  -- 当前发言权过期时间（UTC ISO），用于每轮 10 分钟时间限制。
   expires_at TEXT,
   msg_count INTEGER NOT NULL DEFAULT 0,
   msg_limit INTEGER NOT NULL DEFAULT 10,
@@ -582,6 +582,10 @@ class CaseRepo:
     async def get_turn_state(self, case_id: int) -> Optional[dict]:
         row = await self.db.fetchone("SELECT * FROM turn_state WHERE case_id=?", (case_id,))
         return dict(row) if row else None
+
+    async def list_turn_states(self) -> list[dict]:
+        rows = await self.db.fetchall("SELECT * FROM turn_state ORDER BY case_id ASC")
+        return [dict(r) for r in rows]
 
     async def upsert_turn_state(
         self,

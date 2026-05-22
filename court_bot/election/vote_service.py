@@ -14,13 +14,37 @@ class VoteService:
         self.bot = bot
         self.repo = repo
 
-    async def _registrations_with_field_names(self, election_id: int, registrations: list[dict]) -> list[dict]:
+    async def _resolve_username(self, guild: discord.Guild | None, user_id: int) -> str:
+        if not user_id:
+            return ""
+        if guild is not None:
+            member = guild.get_member(int(user_id))
+            if member is not None:
+                return str(member.name or "")
+        user = self.bot.get_user(int(user_id))
+        if user is not None:
+            return str(user.name or "")
+        if guild is not None:
+            try:
+                member = await guild.fetch_member(int(user_id))
+                return str(member.name or "")
+            except Exception:
+                pass
+        try:
+            user = await self.bot.fetch_user(int(user_id))
+            return str(user.name or "")
+        except Exception:
+            return ""
+
+    async def _registrations_with_field_names(self, election_id: int, registrations: list[dict], *, guild: discord.Guild | None = None, include_usernames: bool = False) -> list[dict]:
         field_names = await self.repo.get_field_names_by_key(int(election_id))
         enriched: list[dict] = []
         for reg in registrations:
             row = dict(reg)
             selected_keys = self.repo.decode_field_keys(row.get("selected_field_keys"))
             row["field_names"] = [field_names.get(key, key) for key in selected_keys]
+            if include_usernames:
+                row["username"] = await self._resolve_username(guild, int(row.get("user_id") or 0))
             enriched.append(row)
         return enriched
 
@@ -28,7 +52,6 @@ class VoteService:
         active_regs = await self.repo.list_active_registrations(int(election["id"]))
         if not active_regs:
             return None
-        active_regs = await self._registrations_with_field_names(int(election["id"]), active_regs)
         vote_id = await self.repo.create_vote(election)
         if channel is None:
             channel = self.bot.get_channel(int(election.get("voting_channel_id") or 0))
@@ -36,6 +59,7 @@ class VoteService:
                 channel = await self.bot.fetch_channel(int(election.get("voting_channel_id") or 0))
         if not isinstance(channel, discord.TextChannel):
             raise ValueError("无法读取投票频道。")
+        active_regs = await self._registrations_with_field_names(int(election["id"]), active_regs, guild=channel.guild, include_usernames=True)
         candidate_list_embeds = build_vote_candidate_list_embeds(election, active_regs)
         msg = await channel.send(
             embeds=[build_vote_entry_embed(election, len(active_regs), guild=channel.guild), *candidate_list_embeds[:1]],
@@ -61,7 +85,11 @@ class VoteService:
             return
         allowed_roles = self.repo.decode_role_ids(election.get("allowed_voter_role_ids"))
         if not can_vote(interaction.user, allowed_roles):
-            await interaction.response.send_message(missing_voter_role_message(allowed_roles) or "你没有本次募选投票资格。", ephemeral=True)
+            await interaction.response.send_message(
+                missing_voter_role_message(allowed_roles) or "你没有本次募选投票资格。",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
         vote_id = int(election.get("vote_id") or 0)
         if not vote_id:
@@ -95,7 +123,11 @@ class VoteService:
             return
         allowed_roles = self.repo.decode_role_ids(fresh.get("allowed_voter_role_ids"))
         if not can_vote(interaction.user, allowed_roles):
-            await interaction.response.send_message(missing_voter_role_message(allowed_roles) or "你没有本次募选投票资格。", ephemeral=True)
+            await interaction.response.send_message(
+                missing_voter_role_message(allowed_roles) or "你没有本次募选投票资格。",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
         vote_id = int(fresh.get("vote_id") or 0)
         if await self.repo.has_vote_record(vote_id, int(interaction.user.id)):

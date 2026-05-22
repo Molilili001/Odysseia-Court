@@ -20,6 +20,9 @@ from .constants import (
     REG_COUNT_DISPLAY_DETAIL,
     REG_COUNT_DISPLAY_HIDDEN,
     REG_COUNT_DISPLAY_TOTAL,
+    REG_REJECTED,
+    REG_REVOKED,
+    REG_WITHDRAWN,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_LABELS,
@@ -115,12 +118,7 @@ def format_role_mentions(role_ids: list[int], *, guild: discord.Guild | None = N
         return f"所有服务器成员均可{action}"
     parts: list[str] = []
     for role_id in role_ids:
-        role_name = None
-        if guild is not None:
-            role = guild.get_role(int(role_id))
-            if role is not None:
-                role_name = sanitize_public_text(role.name, max_len=80, fallback="")
-        label = f"@{role_name}" if role_name else f"身份组ID：{int(role_id)}"
+        label = f"<@&{int(role_id)}>"
         candidate = label if not parts else "、" + label
         if len("".join(parts)) + len(candidate) > max_chars - 1:
             parts.append("…")
@@ -129,12 +127,28 @@ def format_role_mentions(role_ids: list[int], *, guild: discord.Guild | None = N
     return f"拥有以下任意一个身份组即可{action}：" + "".join(parts)
 
 
+def format_discord_username(value: object) -> str:
+    username = sanitize_public_text(value, max_len=80, fallback="").strip()
+    username = username.lstrip("@").replace("`", "ˋ").strip()
+    return f"`{username}`" if username else "未知"
+
+
 def format_candidate_vote_line(candidate: dict[str, Any], *, prefix: str = "") -> str:
     display_name = sanitize_public_text(candidate.get("display_name"), max_len=80)
     user_id = int(candidate.get("user_id") or 0)
     field_names = [sanitize_public_text(name, max_len=40, fallback="") for name in candidate.get("field_names") or []]
     field_text = "、".join(name for name in field_names if name) or "未选择岗位"
     return f"{prefix}{display_name}（用户ID：{user_id}）｜参选：{field_text}"
+
+
+def format_public_candidate_vote_line(candidate: dict[str, Any], *, prefix: str = "") -> str:
+    display_name = sanitize_public_text(candidate.get("display_name"), max_len=80)
+    user_id = int(candidate.get("user_id") or 0)
+    username = format_discord_username(candidate.get("username"))
+    user_mention = f"<@{user_id}>" if user_id else "未知用户"
+    field_names = [sanitize_public_text(name, max_len=40, fallback="") for name in candidate.get("field_names") or []]
+    field_text = "、".join(name for name in field_names if name) or "未选择岗位"
+    return f"{prefix}👤 {display_name}（🏷️ {username}｜🔗 {user_mention}）｜🗳️ 参选：{field_text}"
 
 
 def build_vote_candidate_list_embeds(election: dict[str, Any], candidates: list[dict[str, Any]], *, page_size: int = 20) -> list[discord.Embed]:
@@ -148,7 +162,7 @@ def build_vote_candidate_list_embeds(election: dict[str, Any], candidates: list[
     for page_index in range(total_pages):
         start = page_index * page_size
         page_candidates = candidates[start : start + page_size]
-        lines = [format_candidate_vote_line(candidate, prefix=f"{start + idx}. ") for idx, candidate in enumerate(page_candidates, start=1)]
+        lines = [format_public_candidate_vote_line(candidate, prefix=f"{start + idx}. ") for idx, candidate in enumerate(page_candidates, start=1)]
         embed = discord.Embed(
             title=title if page_index == 0 else title + f"（续 {page_index + 1}）",
             color=COLOR_RED,
@@ -166,35 +180,48 @@ def build_candidate_public_embed(
 ) -> discord.Embed:
     status = str(registration.get("status") or REG_ACTIVE)
     color = COLOR_GREEN if status == REG_ACTIVE else COLOR_GRAY
-    if status == "rejected":
+    if status == REG_REJECTED:
         color = COLOR_ORANGE
-    elif status == "revoked":
+    elif status == REG_REVOKED:
         color = COLOR_RED
-    elif status == "withdrawn":
+    elif status == REG_WITHDRAWN:
         color = COLOR_YELLOW
 
     selected_keys = ElectionRepo.decode_field_keys(registration.get("selected_field_keys"))
     selected_names = [field_names.get(key, key) for key in selected_keys]
     reason = ""
-    if status == "rejected":
+    if status == REG_REJECTED:
         reason = str(registration.get("rejected_reason") or "未填写")
-    elif status == "revoked":
+    elif status == REG_REVOKED:
         reason = str(registration.get("revoked_reason") or "未填写")
 
+    user_id = int(registration.get("user_id") or 0)
+    display_name = sanitize_public_text(registration.get("display_name"), max_len=100)
+    username = format_discord_username(registration.get("username"))
+    user_mention = f"<@{user_id}>" if user_id else "未知用户"
+    status_icon = {
+        REG_ACTIVE: "✅",
+        REG_WITHDRAWN: "↩️",
+        REG_REJECTED: "⚠️",
+        REG_REVOKED: "⛔",
+    }.get(status, "📌")
+    status_label = REGISTRATION_STATUS_LABELS.get(status, status)
+
     embed = discord.Embed(
-        title=f"候选人公示｜{sanitize_public_text(election['name'], max_len=120)}",
+        title=f"【候选人公示】｜{sanitize_public_text(election['name'], max_len=120)}",
         color=color,
     )
-    embed.add_field(name="候选人", value=sanitize_public_text(registration.get("display_name"), max_len=100), inline=True)
-    embed.add_field(name="用户 ID", value=str(int(registration.get("user_id") or 0)), inline=True)
-    embed.add_field(name="当前状态", value=REGISTRATION_STATUS_LABELS.get(status, status), inline=True)
-    embed.add_field(name="参选岗位", value=sanitize_public_text("、".join(selected_names) or "未选择", max_len=1024), inline=False)
+    embed.add_field(name="👤 候选人", value=display_name, inline=True)
+    embed.add_field(name="🏷️ 用户名", value=username, inline=True)
+    embed.add_field(name="🔗 提及", value=user_mention, inline=True)
+    embed.add_field(name="📌 当前状态", value=f"{status_icon} {status_label}", inline=False)
+    embed.add_field(name="🗳️ 参选岗位", value=sanitize_public_text("、".join(selected_names) or "未选择", max_len=1024), inline=False)
     intro = sanitize_public_text(registration.get("self_intro"), max_len=1000, fallback="未填写")
-    embed.add_field(name="参选宣言", value=intro or "未填写", inline=False)
-    embed.add_field(name="报名时间", value=format_time_pair(registration.get("registered_at")), inline=False)
-    embed.add_field(name="最后修改", value=format_time_pair(registration.get("last_modified_at")), inline=False)
+    embed.add_field(name="📝 参选宣言", value=intro or "未填写", inline=False)
+    embed.add_field(name="🕒 报名时间", value=format_time_pair(registration.get("registered_at")), inline=False)
+    embed.add_field(name="🔄 最后修改", value=format_time_pair(registration.get("last_modified_at")), inline=False)
     if reason:
-        embed.add_field(name="状态原因", value=sanitize_public_text(reason, max_len=1000), inline=False)
+        embed.add_field(name="📎 状态原因", value=sanitize_public_text(reason, max_len=1000), inline=False)
     embed.set_footer(text=f"Election ID: {election['id']}｜Registration ID: {registration['id']}")
     return embed
 
@@ -478,6 +505,15 @@ def build_help_embeds() -> list[discord.Embed]:
             "参数：`募选id` 可选；`频道` 可选，不填则使用配置的报名频道。\n"
             "入口按钮：报名、我的报名、编辑报名、撤回报名。\n"
             "入口面板会在阶段变化、报名/投票身份组变更时自动刷新。"
+        ),
+        inline=False,
+    )
+    setup.add_field(
+        name="/募选 刷新入口、/募选 刷新展示",
+        value=(
+            "`刷新入口`：原地编辑已发送的报名入口，不重发新消息。\n"
+            "`刷新展示`：按范围原地刷新报名入口、公示和投票展示消息；适合代码更新后无缝套用新样式。\n"
+            "范围：自动、全部、报名入口、公示、投票面板。"
         ),
         inline=False,
     )

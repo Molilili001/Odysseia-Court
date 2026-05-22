@@ -6,9 +6,23 @@ import unittest
 from pathlib import Path
 
 from court_bot.election.cog import parse_fields_config, parse_role_ids_from_text
-from court_bot.election.constants import PUBLICITY_REALTIME, REG_COUNT_DISPLAY_DETAIL, REG_COUNT_DISPLAY_TOTAL, REG_WITHDRAWN
-from court_bot.election.embeds import build_registration_count_text
-from court_bot.election.permissions import can_register, can_vote
+from court_bot.election.constants import (
+    PUBLIC_PENDING,
+    PUBLICITY_REALTIME,
+    REG_ACTIVE,
+    REG_COUNT_DISPLAY_DETAIL,
+    REG_COUNT_DISPLAY_TOTAL,
+    REG_REJECTED,
+    REG_WITHDRAWN,
+)
+from court_bot.election.embeds import (
+    build_candidate_public_embed,
+    build_registration_count_text,
+    build_vote_candidate_list_embeds,
+    format_candidate_vote_line,
+    format_role_mentions,
+)
+from court_bot.election.permissions import can_register, can_vote, missing_candidate_role_message, missing_voter_role_message
 from court_bot.election.result_service import ResultService
 from court_bot.election.text_utils import contains_forbidden_mention, sanitize_public_text
 from court_bot.election.time_utils import build_schedule, parse_duration_minutes, to_utc_iso
@@ -86,6 +100,49 @@ class ElectionPureFunctionTests(unittest.TestCase):
         self.assertTrue(can_vote(FakeMember([]), []))
         self.assertTrue(can_vote(FakeMember([1, 9]), [2, 9]))
         self.assertFalse(can_vote(FakeMember([1, 3]), [2, 9]))
+
+    def test_role_restriction_text_uses_suppressed_discord_role_mentions(self) -> None:
+        self.assertEqual(
+            format_role_mentions([1134611078203052122, 1383835973384802396], action="报名"),
+            "拥有以下任意一个身份组即可报名：<@&1134611078203052122>、<@&1383835973384802396>",
+        )
+        self.assertEqual(
+            missing_candidate_role_message([1134611078203052122]),
+            "你没有本次募选报名资格；需要拥有以下任意一个身份组：<@&1134611078203052122>。",
+        )
+        self.assertIn("<@&1383835973384802396>", missing_voter_role_message([1383835973384802396]))
+
+    def test_public_candidate_embed_uses_emoji_identity_and_user_mention(self) -> None:
+        embed = build_candidate_public_embed(
+            {"id": 1, "name": "测试募选"},
+            {
+                "id": 9,
+                "user_id": 123456789,
+                "display_name": "候选人A",
+                "selected_field_keys": '["field_1"]',
+                "self_intro": "我的宣言",
+                "status": REG_ACTIVE,
+                "username": "unique_user",
+                "registered_at": None,
+                "last_modified_at": None,
+            },
+            {"field_1": "岗位一"},
+        )
+        fields = {field.name: field.value for field in embed.fields}
+        self.assertIn("【候选人公示】｜测试募选", embed.title or "")
+        self.assertEqual(fields["👤 候选人"], "候选人A")
+        self.assertEqual(fields["🏷️ 用户名"], "`unique_user`")
+        self.assertEqual(fields["🔗 提及"], "<@123456789>")
+        self.assertNotIn("🆔 用户 ID", fields)
+        self.assertEqual(fields["📌 当前状态"], "✅ 有效报名")
+        self.assertEqual(fields["🗳️ 参选岗位"], "岗位一")
+
+    def test_public_vote_list_adds_icons_and_mention_without_changing_private_line(self) -> None:
+        candidate = {"display_name": "候选人A", "username": "unique_user", "user_id": 123456789, "field_names": ["岗位一", "岗位二"]}
+        self.assertEqual(format_candidate_vote_line(candidate, prefix="1. "), "1. 候选人A（用户ID：123456789）｜参选：岗位一、岗位二")
+        embed = build_vote_candidate_list_embeds({"id": 1, "name": "测试募选"}, [candidate])[0]
+        self.assertIn("1. 👤 候选人A（🏷️ `unique_user`｜🔗 <@123456789>）｜🗳️ 参选：岗位一、岗位二", embed.description or "")
+        self.assertNotIn("🆔", embed.description or "")
 
     def test_can_register_or_rule(self) -> None:
         self.assertTrue(can_register(FakeMember([]), []))
@@ -220,6 +277,23 @@ class ElectionRepoAsyncTests(unittest.IsolatedAsyncioTestCase):
         await self.repo.add_vote_record(vote_id=vote_id, election_id=int(election["id"]), voter_id=500, selected_user_ids=[1])
         with self.assertRaises(Exception):
             await self.repo.add_vote_record(vote_id=vote_id, election_id=int(election["id"]), voter_id=500, selected_user_ids=[1])
+
+    async def test_rejected_registration_can_resubmit_intro_with_same_fields(self) -> None:
+        election = await self._create_election()
+        reg = await self.repo.upsert_registration(
+            election=election,
+            user_id=10,
+            display_name="候选人10",
+            selected_field_keys=["field_1"],
+            self_intro="原宣言",
+        )
+        await self.repo.update_registration_public_message(int(reg["id"]), channel_id=12, message_id=12345, status=PUBLIC_PENDING)
+        await self.repo.set_registration_status(election_id=int(election["id"]), user_id=10, status=REG_REJECTED, reason="请修改宣言", operator_id=999)
+        updated = await self.repo.upsert_registration(election=election, user_id=10, display_name="候选人10", selected_field_keys=["field_1"], self_intro="新宣言", public_status_override=PUBLIC_PENDING)
+        self.assertEqual(updated["status"], REG_ACTIVE)
+        self.assertEqual(updated["self_intro"], "新宣言")
+        self.assertEqual(ElectionRepo.decode_field_keys(updated["selected_field_keys"]), ["field_1"])
+        self.assertEqual(updated["public_sync_status"], PUBLIC_PENDING)
 
     async def test_result_order_field_lock_tiebreak_no_fill(self) -> None:
         election = await self._create_election()

@@ -37,12 +37,12 @@ def can_register(member: discord.Member, allowed_candidate_role_ids: list[int] |
 def missing_candidate_role_message(allowed_role_ids: list[int] | tuple[int, ...] | set[int]) -> str:
     if not allowed_role_ids:
         return ""
-    roles = "、".join(str(int(role_id)) for role_id in allowed_role_ids)
+    roles = "、".join(f"<@&{int(role_id)}>" for role_id in allowed_role_ids)
     return f"你没有本次募选报名资格；需要拥有以下任意一个身份组：{roles}。"
 
 
 def missing_voter_role_message(allowed_role_ids: list[int] | tuple[int, ...] | set[int]) -> str:
     if not allowed_role_ids:
         return ""
-    roles = "、".join(str(int(role_id)) for role_id in allowed_role_ids)
+    roles = "、".join(f"<@&{int(role_id)}>" for role_id in allowed_role_ids)
     return f"你没有本次募选投票资格；需要拥有以下任意一个身份组：{roles}。"

@@ -9,6 +9,7 @@ from ..constants import (
     STATUS_AWAITING_JUDGEMENT,
     STATUS_IN_SESSION,
     TURN_MESSAGE_LIMIT,
+    TURN_TIME_LIMIT_MINUTES,
 )
 from ..services.audit import send_audit_log
 from .modals import WithdrawCaseModal
@@ -19,8 +20,8 @@ class CourtView(discord.ui.View):
 
     自主发言模式：
     - 双方默认禁言
-    - 轮到谁，谁点击“获取本轮发言权”后才可最多发 10 条消息（可含图片/文件）
-    - 可手动结束或达到条数上限自动结束
+    - 轮到谁，谁点击“获取本轮发言权”后才可最多发 10 条消息（可含图片/文件），限时 10 分钟
+    - 可手动结束，或达到条数/时间上限自动结束
     """
 
     def __init__(self, *, bot, case_id: int, timeout: float | None = None):
@@ -104,7 +105,7 @@ class CourtView(discord.ui.View):
 
         await interaction.edit_original_response(
             content=(
-                f"已授予你本轮发言权：最多 {TURN_MESSAGE_LIMIT} 条消息（无时间限制）。\n"
+                f"已授予你本轮发言权：最多 {TURN_MESSAGE_LIMIT} 条消息，限时 {TURN_TIME_LIMIT_MINUTES} 分钟。\n"
                 "请直接在本频道发送文字/图片/文件；发完点击『结束本轮发言』。"
             )
         )

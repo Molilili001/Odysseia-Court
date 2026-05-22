@@ -37,6 +37,26 @@ class PublicityService:
                 return None
         return channel if isinstance(channel, discord.TextChannel) else None
 
+    async def _resolve_username(self, guild: discord.Guild, user_id: int) -> str:
+        if not user_id:
+            return ""
+        member = guild.get_member(int(user_id))
+        if member is not None:
+            return str(member.name or "")
+        user = self.bot.get_user(int(user_id))
+        if user is not None:
+            return str(user.name or "")
+        try:
+            member = await guild.fetch_member(int(user_id))
+            return str(member.name or "")
+        except Exception:
+            pass
+        try:
+            user = await self.bot.fetch_user(int(user_id))
+            return str(user.name or "")
+        except Exception:
+            return ""
+
     async def alert(self, election: dict, message: str) -> None:
         channel = await self._get_text_channel(election.get("alert_channel_id") or election.get("public_channel_id"))
         safe_message = message[:1800]
@@ -64,7 +84,11 @@ class PublicityService:
             await self.repo.update_registration_public_message(int(registration["id"]), channel_id=channel_id or None, message_id=None, status=PUBLIC_FAILED, error=error)
             return False
 
-        embed = build_candidate_public_embed(election, registration, field_names)
+        display_registration = dict(registration)
+        display_registration["username"] = await self._resolve_username(
+            channel.guild, int(registration.get("user_id") or 0)
+        )
+        embed = build_candidate_public_embed(election, display_registration, field_names)
         message_id = int(registration.get("public_message_id") or 0)
         try:
             if message_id:

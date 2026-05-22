@@ -24,6 +24,7 @@ from .constants import (
     VIS_PRIVATE,
     VIS_PUBLIC,
     TURN_MESSAGE_LIMIT,
+    TURN_TIME_LIMIT_MINUTES,
     round_label,
     side_label,
 )
@@ -205,7 +206,7 @@ def build_opening_post_embed(case: dict, evidences: Iterable[dict]) -> discord.E
     embed.add_field(
         name="流程说明",
         value=(
-            f"三轮回合制；双方默认禁言。轮到你时点击『获取本轮发言权』，最多发送 {TURN_MESSAGE_LIMIT} 条消息（可含图片/文件），无时间限制。"
+            f"三轮回合制；双方默认禁言。轮到你时点击『获取本轮发言权』，最多发送 {TURN_MESSAGE_LIMIT} 条消息（可含图片/文件），限时 {TURN_TIME_LIMIT_MINUTES} 分钟。"
         ),
         inline=False,
     )
@@ -260,8 +261,8 @@ def build_court_panel_embed(case: dict) -> discord.Embed:
     embed.add_field(
         name="说明",
         value=(
-            f"- 双方默认禁言；轮到你时点击『获取本轮发言权』，最多发送 {TURN_MESSAGE_LIMIT} 条消息（可含图片/文件），无时间限制。\n"
-            "- 发言完毕点击『结束本轮发言』，或达到条数上限自动结束。\n"
+            f"- 双方默认禁言；轮到你时点击『获取本轮发言权』，最多发送 {TURN_MESSAGE_LIMIT} 条消息（可含图片/文件），限时 {TURN_TIME_LIMIT_MINUTES} 分钟。\n"
+            "- 发言完毕点击『结束本轮发言』，或达到条数/时间上限自动结束。\n"
             "- 管理可在需要时强制结束/推进、处理补证等。"
         ),
         inline=False,

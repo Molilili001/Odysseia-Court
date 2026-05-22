@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import inspect
 import math
 from typing import Any
 
 import discord
 
-from .constants import CUSTOM_ID_PREFIX, MAX_SELF_INTRO_LENGTH, REGISTRATION_SELECT_ALL_VALUE
+from .constants import (
+    CUSTOM_ID_PREFIX,
+    MAX_SELF_INTRO_LENGTH,
+    REGISTRATION_SELECT_ALL_VALUE,
+)
 from .embeds import build_vote_confirm_embed, build_vote_page_embed
 
 
@@ -25,37 +30,46 @@ def resolve_registration_selected_field_keys(fields: list[dict[str, Any]], selec
 
 
 class RegistrationIntroModal(discord.ui.Modal):
-    def __init__(self, *, cog, election_id: int, selected_field_keys: list[str], is_edit: bool = False):
-        super().__init__(title="提交募选报名", timeout=300)
+    def __init__(self, *, cog, election_id: int, selected_field_keys: list[str], is_edit: bool = False, intro_only: bool = False, current_intro: str | None = None):
+        title = "修改参选宣言" if intro_only else "提交募选报名"
+        super().__init__(title=title, timeout=300)
         self.cog = cog
         self.election_id = int(election_id)
         self.selected_field_keys = selected_field_keys
         self.is_edit = is_edit
+        self.intro_only = intro_only
         self.self_intro = discord.ui.TextInput(
             label="参选宣言（可选，不能艾特人或身份组）",
             style=discord.TextStyle.paragraph,
             max_length=MAX_SELF_INTRO_LENGTH,
             required=False,
+            default=(current_intro or "")[:MAX_SELF_INTRO_LENGTH],
         )
         self.add_item(self.self_intro)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.cog.handle_registration_submit(
-            interaction,
+        submit_kwargs = dict(
+            interaction=interaction,
             election_id=self.election_id,
             selected_field_keys=self.selected_field_keys,
             self_intro=str(self.self_intro.value or ""),
             is_edit=self.is_edit,
         )
+        if "intro_only" in inspect.signature(self.cog.handle_registration_submit).parameters:
+            submit_kwargs["intro_only"] = self.intro_only
+        await self.cog.handle_registration_submit(
+            **submit_kwargs,
+        )
 
 
 class FieldSelectView(discord.ui.View):
-    def __init__(self, *, cog, election: dict[str, Any], fields: list[dict[str, Any]], is_edit: bool = False):
+    def __init__(self, *, cog, election: dict[str, Any], fields: list[dict[str, Any]], is_edit: bool = False, existing_field_keys: list[str] | None = None):
         super().__init__(timeout=300)
         self.cog = cog
         self.election = election
         self.is_edit = is_edit
         self.fields = list(fields)
+        existing_field_key_set = {str(key) for key in (existing_field_keys or [])}
 
         all_option = discord.SelectOption(
             label="全选",
@@ -67,6 +81,7 @@ class FieldSelectView(discord.ui.View):
                 label=str(field["name"])[:100],
                 value=str(field["field_key"]),
                 description=f"当选人数：{int(field['winner_count'])}"[:100],
+                default=str(field["field_key"]) in existing_field_key_set,
             )
             for field in self.fields[:25]
         ]
@@ -114,6 +129,7 @@ class FieldSelectView(discord.ui.View):
                 election_id=int(self.election["id"]),
                 selected_field_keys=selected_field_keys,
                 is_edit=self.is_edit,
+                current_intro=None,
             )
         )
 

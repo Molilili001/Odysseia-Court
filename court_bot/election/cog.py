@@ -16,11 +16,13 @@ from .constants import (
     MAX_SELF_INTRO_LENGTH,
     PUBLICITY_BATCH,
     PUBLICITY_REALTIME,
+    PUBLIC_PENDING,
     REG_COUNT_DISPLAY_DETAIL,
     REG_COUNT_DISPLAY_HIDDEN,
     REG_COUNT_DISPLAY_TOTAL,
     PUBLIC_SYNC_STATUS_LABELS,
     REGISTRATION_STATUS_LABELS,
+    REG_REJECTED,
     REG_REVOKED,
     REG_WITHDRAWN,
     STATUS_CANCELLED,
@@ -37,6 +39,8 @@ from .embeds import (
     build_registration_count_text,
     build_registration_entry_embed,
     build_status_embed,
+    build_vote_candidate_list_embeds,
+    build_vote_entry_embed,
 )
 from .permissions import can_register, is_election_admin, missing_candidate_role_message
 from .publicity_service import PublicityService
@@ -44,7 +48,7 @@ from .result_service import ResultService
 from .scheduler import ElectionScheduler
 from .text_utils import contains_forbidden_mention, sanitize_public_text
 from .time_utils import build_schedule, format_time_pair, parse_duration_minutes, to_utc_iso, utc_now, utc_now_iso
-from .views import FieldSelectView, RegistrationEntryView, VoteEntryView
+from .views import FieldSelectView, RegistrationEntryView, RegistrationIntroModal, VoteEntryView
 from .vote_service import VoteService
 
 log = logging.getLogger(__name__)
@@ -309,6 +313,67 @@ class ElectionGroup(app_commands.Group):
         except Exception as exc:
             await interaction.edit_original_response(content=f"操作失败：{exc}")
 
+    @app_commands.command(name=locale_str("refresh_entry", zh_CN="刷新入口", zh_TW="刷新入口", en_US="refresh_entry", en_GB="refresh_entry"), description="原地刷新已发送的报名入口")
+    @app_commands.rename(election_id=locale_str("election_id", zh_CN="募选id", zh_TW="募選id", en_US="募选id", en_GB="募选id"))
+    @app_commands.describe(election_id="募选 ID；不填时自动选择当前未完成募选")
+    async def refresh_entry(self, interaction: discord.Interaction, election_id: int | None = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            election = await self.cog.repo.resolve_election(interaction.guild.id, election_id)
+            refreshed = await self.cog.refresh_registration_entry(election, reason="manual_refresh_entry")
+            if not refreshed:
+                await interaction.edit_original_response(
+                    content=(
+                        "刷新失败：该募选尚未记录报名入口消息，或 Bot 无法读取/编辑原消息。"
+                        "如需重新生成入口，可使用 /募选 设置入口。"
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            await interaction.edit_original_response(content=f"已刷新募选 #{election['id']} 的报名入口。")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"刷新失败：{exc}")
+
+    @app_commands.command(name=locale_str("refresh_display", zh_CN="刷新展示", zh_TW="刷新展示", en_US="refresh_display", en_GB="refresh_display"), description="原地刷新报名入口、公示和投票展示消息")
+    @app_commands.choices(
+        scope=[
+            Choice(name="自动", value="auto"),
+            Choice(name="全部", value="all"),
+            Choice(name="报名入口", value="entry"),
+            Choice(name="公示", value="publicity"),
+            Choice(name="投票面板", value="vote"),
+        ]
+    )
+    @app_commands.rename(
+        election_id=locale_str("election_id", zh_CN="募选id", zh_TW="募選id", en_US="募选id", en_GB="募选id"),
+        scope=locale_str("scope", zh_CN="范围", zh_TW="範圍", en_US="范围", en_GB="范围"),
+    )
+    @app_commands.describe(election_id="募选 ID；不填时自动选择当前未完成募选", scope="刷新范围；不填默认按当前阶段自动刷新")
+    async def refresh_display(self, interaction: discord.Interaction, election_id: int | None = None, scope: Choice[str] | None = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            election = await self.cog.repo.resolve_election(interaction.guild.id, election_id)
+            report = await self.cog.refresh_display_messages(
+                interaction.guild,
+                election,
+                scope=(scope.value if scope else "auto"),
+            )
+            await interaction.edit_original_response(content=report[:1900], allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"刷新展示失败：{exc}")
+
     @app_commands.command(name=locale_str("status", zh_CN="状态", zh_TW="狀態", en_US="状态", en_GB="状态"), description="查看募选状态")
     @app_commands.rename(election_id=locale_str("election_id", zh_CN="募选id", zh_TW="募選id", en_US="募选id", en_GB="募选id"))
     @app_commands.describe(election_id="募选 ID；不填时自动选择当前未完成募选")
@@ -322,7 +387,11 @@ class ElectionGroup(app_commands.Group):
             counts = await self.cog.repo.count_registrations_by_status(int(election["id"]))
             vote_count = await self.cog.repo.count_vote_records(int(election["id"]))
             is_admin = isinstance(interaction.user, discord.Member) and is_election_admin(interaction.user)
-            await interaction.response.send_message(embed=build_status_embed(election, fields, counts, vote_count, is_admin_view=is_admin), ephemeral=True)
+            await interaction.response.send_message(
+                embed=build_status_embed(election, fields, counts, vote_count, is_admin_view=is_admin),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         except Exception as exc:
             await interaction.response.send_message(f"查询失败：{exc}", ephemeral=True)
 
@@ -829,6 +898,129 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
             log.exception("Failed to refresh registration entry for election %s", election.get("id"))
             return False
 
+    async def _get_text_channel(self, channel_id: int | None) -> discord.TextChannel | None:
+        if not channel_id:
+            return None
+        channel = self.bot.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(int(channel_id))
+            except Exception:
+                return None
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    @staticmethod
+    def _candidate_list_page_from_footer(footer_text: str | None, election_id: int) -> int | None:
+        prefix = f"Election ID: {int(election_id)}｜候选人名单 "
+        text = str(footer_text or "")
+        if not text.startswith(prefix):
+            return None
+        page_text = text[len(prefix) :].split("/", 1)[0].strip()
+        try:
+            return int(page_text)
+        except ValueError:
+            return None
+
+    async def _refresh_vote_display(self, election: dict[str, Any]) -> list[str]:
+        vote_id = int(election.get("vote_id") or 0)
+        message_id = int(election.get("vote_message_id") or 0)
+        if not vote_id or not message_id:
+            return ["投票面板：未初始化或未记录消息 ID，跳过。"]
+
+        vote = await self.repo.get_vote(vote_id)
+        channel_id = int((vote or {}).get("channel_id") or election.get("voting_channel_id") or 0)
+        channel = await self._get_text_channel(channel_id)
+        if channel is None:
+            return ["投票面板：无法读取投票频道。"]
+
+        active_regs = await self.repo.list_active_registrations(int(election["id"]))
+        active_regs = await self.vote_service._registrations_with_field_names(int(election["id"]), active_regs, guild=channel.guild, include_usernames=True)
+        candidate_list_embeds = build_vote_candidate_list_embeds(election, active_regs)
+        lines: list[str] = []
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.edit(
+                embeds=[build_vote_entry_embed(election, len(active_regs), guild=channel.guild), *candidate_list_embeds[:1]],
+                view=VoteEntryView(cog=self),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            lines.append("投票主面板：成功。")
+        except Exception as exc:
+            lines.append(f"投票主面板：失败（{str(exc)[:120]}）。")
+            return lines
+
+        total_pages = len(candidate_list_embeds)
+        if total_pages <= 1:
+            lines.append("投票候选人名单：仅 1 页，已随主面板刷新。")
+            return lines
+
+        found: dict[int, discord.Message] = {}
+        history_error = ""
+        try:
+            async for history_message in channel.history(limit=200):
+                if int(history_message.id) == message_id:
+                    continue
+                for embed in history_message.embeds:
+                    page = self._candidate_list_page_from_footer(getattr(embed.footer, "text", None), int(election["id"]))
+                    if page is not None and page > 1 and page not in found:
+                        found[page] = history_message
+        except Exception as exc:
+            history_error = str(exc)[:120]
+
+        refreshed = 0
+        missing: list[int] = []
+        for page_number, embed in enumerate(candidate_list_embeds[1:], start=2):
+            target = found.get(page_number)
+            if target is None:
+                missing.append(page_number)
+                continue
+            try:
+                await target.edit(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                refreshed += 1
+            except Exception:
+                missing.append(page_number)
+
+        if history_error:
+            lines.append(f"投票候选人名单：主面板外页面未扫描完成（{history_error}）。")
+        lines.append(f"投票候选人名单：额外页成功 {refreshed}，未定位/失败 {len(missing)}。")
+        if missing:
+            lines.append("未刷新页码：" + "、".join(str(page) for page in missing[:20]))
+        return lines
+
+    async def refresh_display_messages(self, guild: discord.Guild, election: dict[str, Any], *, scope: str = "auto") -> str:
+        scope = str(scope or "auto")
+        valid_scopes = {"auto", "all", "entry", "publicity", "vote"}
+        if scope not in valid_scopes:
+            raise ValueError("未知刷新范围。")
+
+        status = str(election.get("status") or "")
+        if scope == "auto":
+            if status in (STATUS_SETUP, STATUS_REGISTRATION):
+                scopes = ["entry"]
+            elif status == STATUS_REGISTRATION_ENDED:
+                scopes = ["entry", "publicity"]
+            elif status == STATUS_VOTING:
+                scopes = ["entry", "publicity", "vote"]
+            else:
+                scopes = ["entry", "publicity", "vote"]
+        elif scope == "all":
+            scopes = ["entry", "publicity", "vote"]
+        else:
+            scopes = [scope]
+
+        fresh = await self.repo.get_election(int(election["id"])) or election
+        lines = [f"刷新展示｜募选 #{fresh['id']}《{fresh['name']}》", f"范围：{scope}｜状态：{fresh.get('status')}"]
+        if "entry" in scopes:
+            ok = await self.refresh_registration_entry(fresh, reason="manual_refresh_display")
+            lines.append("报名入口：" + ("成功。" if ok else "未刷新（未记录入口消息或无法编辑）。"))
+        if "publicity" in scopes:
+            success, failed = await self.publicity.sync_scope(fresh, scope="published")
+            lines.append(f"公示：成功 {success}，失败 {failed}。")
+        if "vote" in scopes:
+            lines.extend(await self._refresh_vote_display(fresh))
+        await self.repo.log(int(fresh["id"]), int(guild.id), None, "display_refreshed", {"scope": scope, "scopes": scopes})
+        return "\n".join(lines)
+
     async def can_user_register(self, user: discord.abc.User | discord.Member, election: dict[str, Any]) -> bool:
         if not isinstance(user, discord.Member):
             return False
@@ -844,14 +1036,31 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if election.get("status") != STATUS_REGISTRATION:
-            await interaction.response.send_message("当前不在报名阶段。", ephemeral=True)
-            return
         allowed_candidate_roles = self.repo.decode_role_ids(election.get("allowed_candidate_role_ids"))
         if not await self.can_user_register(interaction.user, election):
-            await interaction.response.send_message(missing_candidate_role_message(allowed_candidate_roles) or "你没有报名资格。", ephemeral=True)
+            await interaction.response.send_message(
+                missing_candidate_role_message(allowed_candidate_roles) or "你没有报名资格。",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
         existing = await self.repo.get_registration(int(election["id"]), interaction.user.id)
+        if election.get("status") != STATUS_REGISTRATION:
+            if is_edit and election.get("status") == STATUS_REGISTRATION_ENDED and existing and existing.get("status") == REG_REJECTED:
+                selected_field_keys = self.repo.decode_field_keys(existing.get("selected_field_keys"))
+                await interaction.response.send_modal(
+                    RegistrationIntroModal(
+                        cog=self,
+                        election_id=int(election["id"]),
+                        selected_field_keys=selected_field_keys,
+                        is_edit=True,
+                        intro_only=True,
+                        current_intro=str(existing.get("self_intro") or ""),
+                    )
+                )
+                return
+            await interaction.response.send_message("当前不在报名阶段。", ephemeral=True)
+            return
         if is_edit and not existing:
             await interaction.response.send_message("你尚未报名，不能编辑。", ephemeral=True)
             return
@@ -859,19 +1068,45 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
             await interaction.response.send_message("你的报名已被撤销，不能自助报名，请联系管理员。", ephemeral=True)
             return
         fields = await self.repo.list_fields(int(election["id"]))
-        await interaction.response.send_message("请选择你愿意参选的岗位：", view=FieldSelectView(cog=self, election=election, fields=fields, is_edit=is_edit), ephemeral=True)
+        existing_field_keys = self.repo.decode_field_keys(existing.get("selected_field_keys")) if existing else None
+        await interaction.response.send_message(
+            "请选择你愿意参选的岗位：",
+            view=FieldSelectView(cog=self, election=election, fields=fields, is_edit=is_edit, existing_field_keys=existing_field_keys),
+            ephemeral=True,
+        )
 
-    async def handle_registration_submit(self, interaction: discord.Interaction, *, election_id: int, selected_field_keys: list[str], self_intro: str, is_edit: bool) -> None:
+    async def handle_registration_submit(self, interaction: discord.Interaction, *, election_id: int, selected_field_keys: list[str], self_intro: str, is_edit: bool, intro_only: bool = False) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
         election = await self.repo.get_election(election_id)
-        if not election or election.get("status") != STATUS_REGISTRATION:
-            await interaction.response.send_message("当前不在报名阶段。", ephemeral=True)
+        if not election:
+            await interaction.response.send_message("未找到募选。", ephemeral=True)
             return
         allowed_candidate_roles = self.repo.decode_role_ids(election.get("allowed_candidate_role_ids"))
         if not await self.can_user_register(interaction.user, election):
-            await interaction.response.send_message(missing_candidate_role_message(allowed_candidate_roles) or "你没有报名资格。", ephemeral=True)
+            await interaction.response.send_message(
+                missing_candidate_role_message(allowed_candidate_roles) or "你没有报名资格。",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        existing = await self.repo.get_registration(election_id, interaction.user.id)
+        if intro_only:
+            if election.get("status") != STATUS_REGISTRATION_ENDED:
+                await interaction.response.send_message("当前不在公示阶段，不能使用仅修改宣言流程。", ephemeral=True)
+                return
+            if not existing or existing.get("status") != REG_REJECTED:
+                await interaction.response.send_message("只有公示阶段被打回的报名可以仅修改宣言。", ephemeral=True)
+                return
+            original_field_keys = self.repo.decode_field_keys(existing.get("selected_field_keys"))
+            submitted_field_keys = [str(key) for key in selected_field_keys]
+            if submitted_field_keys != original_field_keys:
+                await interaction.response.send_message("公示阶段只能修改参选宣言，不能修改参选岗位。", ephemeral=True)
+                return
+            selected_field_keys = original_field_keys
+        elif election.get("status") != STATUS_REGISTRATION:
+            await interaction.response.send_message("当前不在报名阶段。", ephemeral=True)
             return
         if contains_forbidden_mention(self_intro):
             await interaction.response.send_message("参选宣言不能包含用户提及、身份组提及、@everyone 或 @here。", ephemeral=True)
@@ -880,22 +1115,27 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
             await interaction.response.send_message(f"参选宣言最多 {MAX_SELF_INTRO_LENGTH} 字。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        existing = await self.repo.get_registration(election_id, interaction.user.id)
+        display_name = str(existing.get("display_name") or interaction.user.display_name) if intro_only and existing else interaction.user.display_name
         reg = await self.repo.upsert_registration(
             election=election,
             user_id=interaction.user.id,
-            display_name=interaction.user.display_name,
+            display_name=display_name,
             selected_field_keys=selected_field_keys,
             self_intro=self_intro,
             is_re_register_after_withdraw=bool(existing and existing.get("status") == REG_WITHDRAWN and not is_edit),
+            public_status_override=PUBLIC_PENDING if intro_only else None,
         )
-        if election.get("publicity_mode") == PUBLICITY_REALTIME:
+        if intro_only or election.get("publicity_mode") == PUBLICITY_REALTIME:
             await self.publicity.sync_registration_publicity(election, reg, allow_create=True)
-        await self.repo.log(election_id, interaction.guild.id, interaction.user.id, "registration_submitted", {"fields": selected_field_keys, "is_edit": is_edit})
+        await self.repo.log(election_id, interaction.guild.id, interaction.user.id, "registration_submitted", {"fields": selected_field_keys, "is_edit": is_edit, "intro_only": intro_only})
         if str(election.get("registration_count_display") or REG_COUNT_DISPLAY_HIDDEN) != REG_COUNT_DISPLAY_HIDDEN:
             fresh = await self.repo.get_election(election_id) or election
             await self.refresh_registration_entry(fresh, reason="registration_submitted")
-        await interaction.edit_original_response(content="报名已保存。" + ("实时公示已同步。" if election.get("publicity_mode") == PUBLICITY_REALTIME else "本场为统一公示模式，报名期内不会公开你的报名。"))
+        if intro_only:
+            message = "参选宣言已更新，并已重新提交为有效报名。"
+        else:
+            message = "报名已保存。" + ("实时公示已同步。" if election.get("publicity_mode") == PUBLICITY_REALTIME else "本场为统一公示模式，报名期内不会公开你的报名。")
+        await interaction.edit_original_response(content=message)
 
     async def show_my_registration(self, interaction: discord.Interaction, election_id: int | None = None) -> None:
         if interaction.guild is None:

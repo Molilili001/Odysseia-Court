@@ -8,6 +8,8 @@ data/*.sqlite
 data/*.sqlite-journal
 data/*.sqlite-wal
 data/*.sqlite-shm
+tools/*.db
+tools/*.db-journal
 deploy/
 bot_visible_texts.txt
 公示统一募选Cog项目计划.txt

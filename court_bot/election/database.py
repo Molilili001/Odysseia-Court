@@ -463,10 +463,11 @@ class ElectionRepo:
         selected_field_keys: list[str],
         self_intro: str | None,
         is_re_register_after_withdraw: bool = False,
+        public_status_override: str | None = None,
     ) -> dict[str, Any]:
         now = utc_now_iso()
         election_id = int(election["id"])
-        public_status = PUBLIC_PENDING if election.get("publicity_mode") == PUBLICITY_REALTIME else PUBLIC_NOT_PUBLISHED
+        public_status = public_status_override or (PUBLIC_PENDING if election.get("publicity_mode") == PUBLICITY_REALTIME else PUBLIC_NOT_PUBLISHED)
         if self.db.conn is None:
             raise RuntimeError("DB not connected")
         async with self.lock:
