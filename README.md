@@ -3,6 +3,7 @@
 Odysseia-Court 是一个面向 Discord 服务器治理的中文 Slash Command Bot，提供 **议诉处理**、**监察组案件处理** 与 **公示统一募选** 三组功能，帮助服务器把投诉、裁决、候补监察、匿名投票、岗位募选等流程集中到 Discord 内完成。
 
 > 说明：本项目是服务器治理与流程协助工具，不构成任何法律建议。
+> 隐私政策：见 [PRIVACY.md](PRIVACY.md)。
 
 ---
 
@@ -78,8 +79,11 @@ Odysseia-Court 是一个面向 Discord 服务器治理的中文 Slash Command Bo
 
 在 Discord Developer Portal 的 Bot 设置中开启：
 
-- **Server Members Intent**
 - **Message Content Intent**
+
+不需要开启 **Server Members Intent**。本项目不监听成员加入/离开事件，也不拉取完整成员列表；成员与身份组信息通过交互对象或按需查询获取。
+
+公开部署前，请将 [PRIVACY.md](PRIVACY.md) 发布到公开可访问地址，并在 Discord Developer Portal 填写 Privacy Policy URL。
 
 ### 3. 准备服务器频道与身份组
 

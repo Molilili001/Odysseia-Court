@@ -45,7 +45,7 @@ class CourtBot(commands.Bot):
     def __init__(self, *, config: Config):
         intents = discord.Intents.default()
         intents.guilds = True
-        intents.members = True  # 用于 role 判断/处罚更稳（需要在开发者后台开启）
+        # 不请求 Server Members privileged intent；成员/角色信息通过交互对象与按需 fetch_member 获取。
         # 归档导出（HTML）与回合发言监管需要读取消息内容（需要在开发者后台开启 Message Content Intent）
         intents.message_content = True
 
@@ -1213,4 +1213,3 @@ class CourtBot(commands.Bot):
                 # 归档可能产生较大的 bytes/base64/zip 对象；归档结束后主动触发一次回收，降低小内存 VPS 峰值残留。
                 result = None
                 gc.collect()
-
