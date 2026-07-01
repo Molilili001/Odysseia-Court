@@ -4,7 +4,7 @@ import discord
 
 from .constants import STATUS_VOTING
 from .database import ElectionRepo
-from .embeds import build_vote_candidate_list_embeds, build_vote_entry_embed, build_vote_page_embed
+from .embeds import build_my_vote_status_embed, build_vote_candidate_list_embeds, build_vote_entry_embed, build_vote_page_embed
 from .permissions import can_vote, missing_voter_role_message
 from .views import VoteEntryView, VoteSelectionView
 
@@ -112,6 +112,48 @@ class VoteService:
             view=view,
             ephemeral=True,
         )
+
+    async def _selected_vote_candidates(self, election: dict, vote_record: dict | None) -> list[dict]:
+        if not vote_record:
+            return []
+        selected_user_ids: list[int] = []
+        for value in self.repo.decode_field_keys(vote_record.get("selected_user_ids")):
+            try:
+                selected_user_ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        field_names = await self.repo.get_field_names_by_key(int(election["id"]))
+        selected_candidates: list[dict] = []
+        for user_id in selected_user_ids:
+            reg = await self.repo.get_registration(int(election["id"]), int(user_id))
+            if not reg:
+                selected_candidates.append({"user_id": int(user_id), "display_name": "未知候选人", "field_names": [], "missing": True})
+                continue
+            row = dict(reg)
+            selected_keys = self.repo.decode_field_keys(row.get("selected_field_keys"))
+            row["field_names"] = [field_names.get(key, key) for key in selected_keys]
+            selected_candidates.append(row)
+        return selected_candidates
+
+    async def show_my_vote_status(self, interaction: discord.Interaction, election: dict) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        allowed_roles = self.repo.decode_role_ids(election.get("allowed_voter_role_ids"))
+        is_eligible = can_vote(interaction.user, allowed_roles)
+        eligibility_note = None if is_eligible else (missing_voter_role_message(allowed_roles) or "你当前没有本次募选投票资格。")
+        vote_record = await self.repo.get_vote_record_for_voter(int(election["id"]), int(interaction.user.id))
+        invalidation = await self.repo.get_vote_invalidation(int(election["id"]), int(interaction.user.id))
+        selected_candidates = await self._selected_vote_candidates(election, vote_record)
+        embed = build_my_vote_status_embed(
+            election,
+            vote_record,
+            selected_candidates,
+            invalidation=invalidation,
+            is_eligible=is_eligible,
+            eligibility_note=eligibility_note,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     async def confirm_vote(self, interaction: discord.Interaction, *, election: dict, selected_user_ids: list[int]) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):

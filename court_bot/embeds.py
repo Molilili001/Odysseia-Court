@@ -215,6 +215,34 @@ def build_opening_post_embed(case: dict, evidences: Iterable[dict]) -> discord.E
     return embed
 
 
+def build_court_started_dm_content(
+    case: dict,
+    *,
+    court_mention: str,
+    court_url: str,
+    approved_visibility: str | None = None,
+) -> str:
+    """开庭时私信双方当事人的纯文本通知。"""
+
+    vis = visibility_label(
+        approved_visibility
+        or case.get("approved_visibility")
+        or case.get("requested_visibility")
+        or ""
+    )
+    rule_text = _truncate((case.get("rule_text") or "").strip(), 600) or "（空）"
+    return (
+        f"议诉 #{case['id']} 已开始（{vis}）。\n"
+        f"议诉频道：{court_mention}\n"
+        f"直达链接：{court_url}\n\n"
+        f"投诉人：<@{case['complainant_id']}>\n"
+        f"被投诉人：<@{case['defendant_id']}>\n"
+        f"违反规则：{rule_text}\n\n"
+        "请进入议诉频道查看首楼说明与控制面板。双方默认禁言；"
+        "轮到你时点击『获取本轮发言权』，发言完毕点击『结束本轮发言』。"
+    )
+
+
 def build_court_panel_embed(case: dict) -> discord.Embed:
     color = COLOR_ORANGE if case.get("status") == STATUS_IN_SESSION else COLOR_GRAY
 

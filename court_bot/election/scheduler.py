@@ -45,6 +45,10 @@ class ElectionScheduler:
                 await self.process_election(election, now=now)
             except Exception:
                 log.exception("Failed to process election scheduler for %s", election.get("id"))
+        try:
+            await self.cog.continuous.finalize_due_applications()
+        except Exception:
+            log.exception("Failed to process continuous application scheduler")
 
     async def process_election(self, election: dict, *, now) -> None:
         status = str(election.get("status"))

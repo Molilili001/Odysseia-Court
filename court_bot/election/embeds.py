@@ -288,7 +288,10 @@ def build_vote_entry_embed(election: dict[str, Any], active_count: int, *, guild
     embed = discord.Embed(
         title=f"统一投票｜{sanitize_public_text(election['name'], max_len=120)}",
         color=COLOR_RED,
-        description="下方会列出全部有效候选人。点击『开始投票』进入私密分页选择界面；投票提交后不能更改。",
+        description=(
+            "下方会列出全部有效候选人。点击『开始投票』进入私密分页选择界面；投票提交后不能更改。"
+            "点击『我的投票』可私密查看自己是否已投票及已提交的选择。"
+        ),
     )
     embed.add_field(name="有效候选人数", value=str(active_count), inline=True)
     embed.add_field(name="每人最多可投", value=f"{int(election.get('vote_max_selections') or 0)} 人", inline=True)
@@ -322,6 +325,84 @@ def build_vote_confirm_embed(election: dict[str, Any], selected_regs: list[dict[
     )
     chunks = split_lines_for_embed(lines, max_chars=3500)
     embed.add_field(name=f"已选择 {len(selected_regs)} 人", value=chunks[0], inline=False)
+    return embed
+
+
+def build_my_vote_status_embed(
+    election: dict[str, Any],
+    vote_record: dict[str, Any] | None,
+    selected_candidates: list[dict[str, Any]],
+    *,
+    invalidation: dict[str, Any] | None = None,
+    is_eligible: bool = True,
+    eligibility_note: str | None = None,
+) -> discord.Embed:
+    """Build a private self-service view of one voter's submitted ballot."""
+
+    election_status = str(election.get("status") or "")
+    election_status_label = STATUS_LABELS.get(election_status, election_status or "未知")
+    if invalidation is not None:
+        color = COLOR_RED
+        vote_status = "已被管理员作废"
+        description = "你的投票记录已被管理员作废，不能重新投票。如有疑问请联系管理员。"
+    elif vote_record is not None:
+        color = COLOR_GREEN
+        vote_status = "已提交"
+        description = "你已经完成投票。以下内容仅你本人可见；投票提交后不能更改。"
+    else:
+        color = COLOR_GRAY
+        vote_status = "尚未提交"
+        if election_status == STATUS_VOTING:
+            description = "你尚未提交本场募选投票。可回到投票面板点击『开始投票』。"
+        else:
+            description = "当前没有你的投票记录。"
+
+    embed = discord.Embed(
+        title=f"我的投票情况｜{sanitize_public_text(election['name'], max_len=120)}",
+        color=color,
+        description=description,
+    )
+    embed.add_field(name="募选 ID", value=str(election["id"]), inline=True)
+    embed.add_field(name="当前阶段", value=election_status_label, inline=True)
+    embed.add_field(name="投票状态", value=vote_status, inline=True)
+    embed.add_field(name="投票结束", value=format_time_pair(election.get("voting_end_at")), inline=False)
+    if vote_record is not None:
+        embed.add_field(name="提交时间", value=format_time_pair(vote_record.get("created_at")), inline=False)
+    if invalidation is not None:
+        embed.add_field(name="作废时间", value=format_time_pair(invalidation.get("created_at")), inline=False)
+        reason = sanitize_public_text(invalidation.get("reason"), max_len=1000, fallback="未填写")
+        embed.add_field(name="作废原因", value=reason or "未填写", inline=False)
+    if not is_eligible:
+        embed.add_field(name="当前投票资格", value=(eligibility_note or "当前不具备本场募选投票资格。")[:1024], inline=False)
+
+    if vote_record is not None:
+        lines: list[str] = []
+        for idx, candidate in enumerate(selected_candidates, start=1):
+            user_id = int(candidate.get("user_id") or 0)
+            if candidate.get("missing"):
+                lines.append(f"{idx}. 未找到候选人记录（用户ID：{user_id}）")
+                continue
+            line = format_candidate_vote_line(candidate, prefix=f"{idx}. ")
+            reg_status = str(candidate.get("status") or REG_ACTIVE)
+            if reg_status != REG_ACTIVE:
+                line += f"｜当前报名状态：{REGISTRATION_STATUS_LABELS.get(reg_status, reg_status)}"
+            line = sanitize_public_text(line, max_len=700, fallback="")
+            lines.append(line)
+        chunks = split_lines_for_embed(lines, max_chars=900) if lines else []
+        if not chunks:
+            embed.add_field(name="已选择候选人", value="记录为空或候选人已不可见。", inline=False)
+        else:
+            remaining_slots = max(0, 25 - len(embed.fields))
+            displayed_chunks = chunks[:remaining_slots]
+            truncated = len(chunks) > len(displayed_chunks)
+            for chunk_idx, chunk in enumerate(displayed_chunks, start=1):
+                suffix = "" if chunk_idx == 1 else f"（续 {chunk_idx}）"
+                value = chunk
+                if truncated and chunk_idx == len(displayed_chunks):
+                    value = f"{chunk}\n…后续内容已省略。"[:1024]
+                embed.add_field(name=f"已选择候选人{suffix}", value=value, inline=False)
+
+    embed.set_footer(text="仅你本人可见；不会公开谁投给谁。")
     return embed
 
 
@@ -474,7 +555,7 @@ def build_help_embeds() -> list[discord.Embed]:
     overview.add_field(
         name="权限与安全",
         value=(
-            "管理命令需要 `Manage Guild` 或 `Administrator`。\n"
+            "未配置募选管理身份组时，管理命令使用 `Manage Guild` 或 `Administrator` 兜底；配置后允许 `Administrator` 或任一募选管理身份组。\n"
             "参选宣言禁止用户提及、身份组提及、`@everyone`、`@here`。\n"
             "投票不会公开“谁投给谁”；清除投票会禁止该成员重新投票。"
         ),
@@ -486,6 +567,16 @@ def build_help_embeds() -> list[discord.Embed]:
         title="募选系统帮助｜2/4 创建与配置命令",
         color=COLOR_BLUE,
         description="以下命令主要给管理员使用，用于创建、配置、查看和管理候选人。",
+    )
+    setup.add_field(
+        name="/募选 设置",
+        value=(
+            "用途：查看或更新募选模块管理身份组。\n"
+            "未配置：管理命令使用 `Manage Guild` 或 `Administrator` 兜底。\n"
+            "已配置：管理命令允许 `Administrator` 或任一募选管理身份组使用。\n"
+            "填写 `清空`、`none`、`all` 可恢复原生权限兜底。"
+        ),
+        inline=False,
     )
     setup.add_field(
         name="/募选 创建",
@@ -571,9 +662,10 @@ def build_help_embeds() -> list[discord.Embed]:
         inline=False,
     )
     voter.add_field(
-        name="/募选 我的报名、/募选 帮助",
+        name="/募选 我的报名、/募选 我的投票、/募选 帮助",
         value=(
             "`/募选 我的报名`：不用找入口消息，也能查看自己的报名。可填 `募选id`。\n"
+            "`/募选 我的投票`：私密查看自己是否已投票、已提交的选择或作废状态。可填 `募选id`。\n"
             "`/募选 帮助`：显示当前帮助文档。"
         ),
         inline=False,
@@ -602,7 +694,8 @@ def build_help_embeds() -> list[discord.Embed]:
         value=(
             "点击 `开始投票` 后进入私密分页选择界面。\n"
             "可以跨页累计选择；超过上限时本次选择不会保存。\n"
-            "点击 `完成选择` 后确认，提交后不可更改；不会公开投票明细。"
+            "点击 `完成选择` 后确认，提交后不可更改；不会公开投票明细。\n"
+            "点击 `我的投票` 可私密查看自己的当前投票情况。"
         ),
         inline=False,
     )

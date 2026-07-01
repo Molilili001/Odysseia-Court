@@ -32,6 +32,17 @@ from .constants import (
     STATUS_REGISTRATION_ENDED,
     STATUS_VOTING,
 )
+from .continuous_database import ContinuousApplicationRepo
+from .continuous_constants import (
+    CONT_DEFAULT_APPROVAL_THRESHOLD_PERCENT,
+    CONT_DEFAULT_COOLDOWN_DURATION_TEXT,
+    CONT_DEFAULT_MIN_TOTAL_VOTES,
+    CONT_DEFAULT_VOTING_DURATION_TEXT,
+    CONT_MODE_APPROVAL,
+    CONT_MODE_SUPPORT,
+)
+from .continuous_logic import parse_continuous_fields_config
+from .continuous_service import ContinuousApplicationService
 from .database import ElectionRepo
 from .embeds import (
     build_election_list_embed,
@@ -41,8 +52,9 @@ from .embeds import (
     build_status_embed,
     build_vote_candidate_list_embeds,
     build_vote_entry_embed,
+    format_role_mentions,
 )
-from .permissions import can_register, is_election_admin, missing_candidate_role_message
+from .permissions import can_register, is_election_admin, is_election_native_admin, missing_candidate_role_message
 from .publicity_service import PublicityService
 from .result_service import ResultService
 from .scheduler import ElectionScheduler
@@ -144,6 +156,270 @@ def require_bot_channel_permissions(
     if missing_lines:
         raise ValueError("Bot 频道权限不足：\n" + "\n".join(missing_lines))
 
+
+class ContinuousElectionGroup(app_commands.Group):
+    def __init__(self, cog: "ElectionCog"):
+        super().__init__(
+            name=locale_str("continuous", zh_CN="常态", zh_TW="常態", en_US="常态", en_GB="常态"),
+            description=locale_str("Continuous applications", zh_CN="常态申请", zh_TW="常態申請", en_US="常态申请", en_GB="常态申请"),
+        )
+        self.cog = cog
+
+    async def _admin(self, interaction: discord.Interaction) -> bool:
+        return await self.cog.is_admin(interaction)
+
+    def _validate_role_ids(self, guild: discord.Guild, role_ids: list[int], label: str) -> None:
+        for role_id in role_ids:
+            if guild.get_role(int(role_id)) is None:
+                raise ValueError(f"找不到{label}身份组：{role_id}")
+
+    @app_commands.command(name=locale_str("create", zh_CN="创建", zh_TW="建立", en_US="创建", en_GB="创建"), description="创建常态申请入口配置")
+    @app_commands.rename(
+        name=locale_str("name", zh_CN="名称", zh_TW="名稱", en_US="名称", en_GB="名称"),
+        fields_config=locale_str("fields_config", zh_CN="岗位列表", zh_TW="崗位列表", en_US="岗位列表", en_GB="岗位列表"),
+        entry_channel=locale_str("entry_channel", zh_CN="入口频道", zh_TW="入口頻道", en_US="入口频道", en_GB="入口频道"),
+        voting_channel=locale_str("voting_channel", zh_CN="投票频道", zh_TW="投票頻道", en_US="投票频道", en_GB="投票频道"),
+        public_channel=locale_str("public_channel", zh_CN="公示频道", zh_TW="公示頻道", en_US="公示频道", en_GB="公示频道"),
+        mode=locale_str("mode", zh_CN="模式", zh_TW="模式", en_US="模式", en_GB="模式"),
+        support_target_votes=locale_str("support_target_votes", zh_CN="支持目标票数", zh_TW="支持目標票數", en_US="支持目标票数", en_GB="支持目标票数"),
+        min_total_votes=locale_str("min_total_votes", zh_CN="最低总票数", zh_TW="最低總票數", en_US="最低总票数", en_GB="最低总票数"),
+        approval_threshold_percent=locale_str("approval_threshold_percent", zh_CN="同意比例百分比", zh_TW="同意比例百分比", en_US="同意比例百分比", en_GB="同意比例百分比"),
+        voting_duration=locale_str("voting_duration", zh_CN="投票时长", zh_TW="投票時長", en_US="投票时长", en_GB="投票时长"),
+        cooldown_duration=locale_str("cooldown_duration", zh_CN="冷却期", zh_TW="冷卻期", en_US="冷却期", en_GB="冷却期"),
+        application_roles=locale_str("application_roles", zh_CN="允许申请身份组", zh_TW="允許申請身分組", en_US="允许申请身份组", en_GB="允许申请身份组"),
+        voting_roles=locale_str("voting_roles", zh_CN="允许投票身份组", zh_TW="允許投票身分組", en_US="允许投票身份组", en_GB="允许投票身份组"),
+        send_entry=locale_str("send_entry", zh_CN="立即发送入口", zh_TW="立即發送入口", en_US="立即发送入口", en_GB="立即发送入口"),
+    )
+    @app_commands.choices(
+        mode=[
+            Choice(name="同意/反对投票", value=CONT_MODE_APPROVAL),
+            Choice(name="支持票收集", value=CONT_MODE_SUPPORT),
+        ]
+    )
+    @app_commands.describe(
+        name="配置名称，对外展示在入口、投票和公示中",
+        fields_config="岗位列表，例如：管理组,技术组,创作者；一次申请一个岗位",
+        entry_channel="发送长期申请入口的频道",
+        voting_channel="发布一体式申请投票消息的频道",
+        public_channel="发布通过、未通过、退出等结果动态的频道",
+        mode="常态申请模式；不填默认同意/反对投票，填写支持目标票数时自动使用支持票收集",
+        support_target_votes="支持票收集模式的通过目标票数；达到后立即通过并公示支持者",
+        min_total_votes="通过所需最低总票数；不填默认 1 票",
+        approval_threshold_percent="通过所需同意比例百分比；不填默认 51",
+        voting_duration="例如：2天、48小时、12小时；不填默认 7天",
+        cooldown_duration="未通过或退出后的冷却期；不填默认 7天，可填 0小时",
+        application_roles="允许申请身份组 ID/提及，逗号分隔；不填表示所有成员可申请",
+        voting_roles="允许投票身份组 ID/提及，逗号分隔；不填表示所有成员可投票",
+        send_entry="是否创建后立即发送长期入口",
+    )
+    async def create(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        fields_config: str,
+        entry_channel: discord.TextChannel,
+        voting_channel: discord.TextChannel,
+        public_channel: discord.TextChannel,
+        mode: Choice[str] | None = None,
+        support_target_votes: int | None = None,
+        min_total_votes: int | None = None,
+        approval_threshold_percent: float | None = None,
+        voting_duration: str | None = None,
+        cooldown_duration: str | None = None,
+        application_roles: str | None = None,
+        voting_roles: str | None = None,
+        send_entry: bool = True,
+    ) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not await self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            fields = parse_continuous_fields_config(fields_config)
+            require_bot_channel_permissions(
+                interaction.guild,
+                [("入口频道", entry_channel), ("投票频道", voting_channel), ("公示频道", public_channel)],
+            )
+            mode_value = str(mode.value) if mode is not None else (CONT_MODE_SUPPORT if support_target_votes is not None else CONT_MODE_APPROVAL)
+            if mode_value not in (CONT_MODE_APPROVAL, CONT_MODE_SUPPORT):
+                raise ValueError("未知常态申请模式。")
+            if mode is not None and mode.value == CONT_MODE_APPROVAL and support_target_votes is not None:
+                raise ValueError("同意/反对投票模式不使用支持目标票数。")
+            if mode_value == CONT_MODE_SUPPORT:
+                if support_target_votes is None:
+                    raise ValueError("支持票收集模式必须填写支持目标票数。")
+                if int(support_target_votes) < 1:
+                    raise ValueError("支持目标票数必须大于 0。")
+            min_total_votes = int(min_total_votes) if min_total_votes is not None else CONT_DEFAULT_MIN_TOTAL_VOTES
+            approval_threshold_percent = float(approval_threshold_percent) if approval_threshold_percent is not None else CONT_DEFAULT_APPROVAL_THRESHOLD_PERCENT
+            voting_duration = (voting_duration or CONT_DEFAULT_VOTING_DURATION_TEXT).strip() or CONT_DEFAULT_VOTING_DURATION_TEXT
+            cooldown_duration = (cooldown_duration or CONT_DEFAULT_COOLDOWN_DURATION_TEXT).strip() or CONT_DEFAULT_COOLDOWN_DURATION_TEXT
+            if min_total_votes < 1:
+                raise ValueError("最低总票数必须大于 0。")
+            if approval_threshold_percent <= 0 or approval_threshold_percent > 100:
+                raise ValueError("同意比例百分比必须大于 0 且不超过 100。")
+            application_role_ids = parse_role_ids_from_text(application_roles)
+            voter_role_ids = parse_role_ids_from_text(voting_roles)
+            self._validate_role_ids(interaction.guild, application_role_ids, "允许申请")
+            self._validate_role_ids(interaction.guild, voter_role_ids, "允许投票")
+            voting_minutes = parse_duration_minutes(voting_duration, label="投票时长")
+            cooldown_minutes = parse_duration_minutes(cooldown_duration, allow_zero=True, label="冷却期")
+            config_id = await self.cog.continuous_repo.create_config(
+                guild_id=interaction.guild.id,
+                name=sanitize_public_text(name, max_len=120, fallback="常态申请"),
+                entry_channel_id=entry_channel.id,
+                voting_channel_id=voting_channel.id,
+                public_channel_id=public_channel.id,
+                allowed_application_role_ids=application_role_ids,
+                allowed_voter_role_ids=voter_role_ids,
+                min_total_votes=min_total_votes,
+                approval_threshold_percent=approval_threshold_percent,
+                voting_duration_minutes=voting_minutes,
+                cooldown_minutes=cooldown_minutes,
+                created_by=interaction.user.id,
+                fields=fields,
+                mode=mode_value,
+                support_target_votes=int(support_target_votes) if support_target_votes is not None else None,
+            )
+            config = await self.cog.continuous_repo.get_config(config_id)
+            if config and send_entry:
+                await self.cog.continuous.send_entry(config, channel=entry_channel)
+            await self.cog.repo.log(None, interaction.guild.id, interaction.user.id, "continuous_config_created", {"config_id": config_id, "name": name})
+            await interaction.edit_original_response(content=f"已创建常态申请配置 #{config_id}。{' 已发送入口。' if send_entry else ''}")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"创建常态申请失败：{exc}")
+
+    @app_commands.command(name=locale_str("entry", zh_CN="入口", zh_TW="入口", en_US="入口", en_GB="入口"), description="发送或重发常态申请入口")
+    @app_commands.rename(
+        config_id=locale_str("config_id", zh_CN="配置id", zh_TW="配置id", en_US="配置id", en_GB="配置id"),
+        channel=locale_str("channel", zh_CN="频道", zh_TW="頻道", en_US="频道", en_GB="频道"),
+    )
+    @app_commands.describe(config_id="常态申请配置 ID；不填时若只有一个配置则自动选择", channel="入口频道；不填则使用配置的入口频道")
+    async def entry(self, interaction: discord.Interaction, config_id: int | None = None, channel: discord.TextChannel | None = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not await self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            config = await self.cog.continuous_repo.resolve_config(interaction.guild.id, config_id)
+            if channel is not None:
+                require_bot_channel_permissions(interaction.guild, [("入口频道", channel)])
+            msg = await self.cog.continuous.send_entry(config, channel=channel)
+            await interaction.edit_original_response(content=f"已发送常态申请入口：{msg.jump_url}")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"发送入口失败：{exc}")
+
+    @app_commands.command(name=locale_str("status", zh_CN="状态", zh_TW="狀態", en_US="状态", en_GB="状态"), description="查看常态申请配置状态")
+    @app_commands.rename(config_id=locale_str("config_id", zh_CN="配置id", zh_TW="配置id", en_US="配置id", en_GB="配置id"))
+    @app_commands.describe(config_id="常态申请配置 ID；不填则列出全部常态配置")
+    async def status(self, interaction: discord.Interaction, config_id: int | None = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        try:
+            embed = await self.cog.continuous.build_status_embed(interaction.guild.id, config_id=config_id)
+            await interaction.response.send_message(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            await interaction.response.send_message(f"查询失败：{exc}", ephemeral=True)
+
+    @app_commands.command(name=locale_str("approved", zh_CN="通过名单", zh_TW="通過名單", en_US="通过名单", en_GB="通过名单"), description="查看常态申请通过名单")
+    @app_commands.rename(
+        config_id=locale_str("config_id", zh_CN="配置id", zh_TW="配置id", en_US="配置id", en_GB="配置id"),
+        field_name=locale_str("field_name", zh_CN="岗位", zh_TW="崗位", en_US="岗位", en_GB="岗位"),
+    )
+    @app_commands.describe(config_id="常态申请配置 ID；不填则查询本服务器全部配置", field_name="按岗位名称过滤；不填则显示全部岗位")
+    async def approved(self, interaction: discord.Interaction, config_id: int | None = None, field_name: str | None = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        try:
+            embed = await self.cog.continuous.build_approved_list_embed(interaction.guild.id, config_id=config_id, field_name=field_name)
+            await interaction.response.send_message(embed=embed, ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            await interaction.response.send_message(f"查询失败：{exc}", ephemeral=True)
+
+    @app_commands.command(name=locale_str("finish", zh_CN="结束投票", zh_TW="結束投票", en_US="结束投票", en_GB="结束投票"), description="手动结束一条常态申请投票并结算")
+    @app_commands.rename(
+        application_id=locale_str("application_id", zh_CN="申请id", zh_TW="申請id", en_US="申请id", en_GB="申请id"),
+        confirm=locale_str("confirm", zh_CN="确认执行", zh_TW="確認執行", en_US="确认执行", en_GB="确认执行"),
+    )
+    @app_commands.describe(application_id="要结算的常态申请 ID", confirm="必须设置为 True")
+    async def finish(self, interaction: discord.Interaction, application_id: int, confirm: bool = False) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not await self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        if not confirm:
+            await interaction.response.send_message("请将“确认执行”设置为 True。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            application = await self.cog.continuous_repo.get_application(application_id)
+            if not application or int(application.get("guild_id") or 0) != int(interaction.guild.id):
+                raise ValueError("未找到该申请，或该申请不属于当前服务器。")
+            result = await self.cog.continuous.finalize_application(application, operator_id=interaction.user.id)
+            await interaction.edit_original_response(content="已结算该申请投票。" if result is not None else "该申请不在投票中，无需结算。")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"结算失败：{exc}")
+
+    @app_commands.command(name=locale_str("cancel", zh_CN="取消申请", zh_TW="取消申請", en_US="取消申请", en_GB="取消申请"), description="管理员取消一条投票中的常态申请")
+    @app_commands.rename(
+        application_id=locale_str("application_id", zh_CN="申请id", zh_TW="申請id", en_US="申请id", en_GB="申请id"),
+        reason=locale_str("reason", zh_CN="原因", zh_TW="原因", en_US="原因", en_GB="原因"),
+    )
+    @app_commands.describe(application_id="要取消的常态申请 ID", reason="取消原因")
+    async def cancel(self, interaction: discord.Interaction, application_id: int, reason: str | None = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not await self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await self.cog.continuous.manual_cancel_application(guild=interaction.guild, application_id=application_id, operator_id=interaction.user.id, reason=reason)
+            await interaction.edit_original_response(content="已取消该常态申请。")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"取消失败：{exc}")
+
+    @app_commands.command(name=locale_str("remove_approved", zh_CN="移除通过", zh_TW="移除通過", en_US="移除通过", en_GB="移除通过"), description="管理员将成员移出常态申请通过名单")
+    @app_commands.rename(
+        config_id=locale_str("config_id", zh_CN="配置id", zh_TW="配置id", en_US="配置id", en_GB="配置id"),
+        member=locale_str("member", zh_CN="成员", zh_TW="成員", en_US="成员", en_GB="成员"),
+        field_name=locale_str("field_name", zh_CN="岗位", zh_TW="崗位", en_US="岗位", en_GB="岗位"),
+        reason=locale_str("reason", zh_CN="原因", zh_TW="原因", en_US="原因", en_GB="原因"),
+    )
+    @app_commands.describe(config_id="常态申请配置 ID", member="要移除的成员", field_name="可选：指定岗位", reason="移除原因")
+    async def remove_approved(self, interaction: discord.Interaction, config_id: int, member: discord.Member, field_name: str | None = None, reason: str | None = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not await self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await self.cog.continuous.manual_remove_approved(
+                guild=interaction.guild,
+                config_id=config_id,
+                user_id=member.id,
+                operator_id=interaction.user.id,
+                field_name=sanitize_public_text(field_name, max_len=80, fallback="").strip() or None,
+                reason=reason,
+            )
+            await interaction.edit_original_response(content="已移出通过名单，并按配置写入冷却期。")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"移除失败：{exc}")
+
+
 class ElectionGroup(app_commands.Group):
     def __init__(self, cog: "ElectionCog"):
         super().__init__(
@@ -151,9 +427,48 @@ class ElectionGroup(app_commands.Group):
             description=locale_str("Election system", zh_CN="募选系统", zh_TW="募選系統", en_US="募选系统", en_GB="募选系统"),
         )
         self.cog = cog
+        self.add_command(ContinuousElectionGroup(cog))
 
-    def _admin(self, interaction: discord.Interaction) -> bool:
-        return isinstance(interaction.user, discord.Member) and is_election_admin(interaction.user)
+    async def _admin(self, interaction: discord.Interaction) -> bool:
+        return await self.cog.is_admin(interaction)
+
+    @app_commands.command(name=locale_str("settings", zh_CN="设置", zh_TW="設定", en_US="设置", en_GB="设置"), description="查看或更新募选模块管理身份组")
+    @app_commands.rename(admin_roles=locale_str("admin_roles", zh_CN="管理身份组", zh_TW="管理身分組", en_US="管理身份组", en_GB="管理身份组"))
+    @app_commands.describe(admin_roles="身份组 ID/提及，逗号或空格分隔；不填只查看，填 清空/none/all 可清空并恢复原生权限兜底")
+    async def settings(self, interaction: discord.Interaction, admin_roles: str | None = None) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if admin_roles is not None:
+            if not is_election_native_admin(interaction.user):
+                await interaction.response.send_message("无权限（需要 Manage Guild 或 Administrator）。", ephemeral=True)
+                return
+            try:
+                role_ids = parse_role_ids_from_text(admin_roles)
+                for role_id in role_ids:
+                    if interaction.guild.get_role(int(role_id)) is None:
+                        raise ValueError(f"找不到募选管理身份组：{role_id}")
+                await self.cog.repo.set_admin_role_ids(interaction.guild.id, role_ids)
+                await self.cog.repo.log(None, interaction.guild.id, interaction.user.id, "election_settings_updated", {"admin_role_ids": role_ids})
+            except Exception as exc:
+                await interaction.response.send_message(f"设置失败：{exc}", ephemeral=True)
+                return
+        elif not (await self._admin(interaction) or is_election_native_admin(interaction.user)):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+
+        role_ids = await self.cog.repo.get_admin_role_ids(interaction.guild.id)
+        if role_ids:
+            role_text = format_role_mentions(role_ids, action="管理募选")
+            note = "管理命令允许 Administrator 或以上任意一个募选管理身份组使用。"
+        else:
+            role_text = "未配置募选管理身份组。"
+            note = "管理命令使用 Administrator 或 Manage Guild 兜底。"
+        await interaction.response.send_message(
+            f"当前募选管理设置：\n- 管理身份组：{role_text}\n- 规则：{note}",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @app_commands.command(name=locale_str("create", zh_CN="创建", zh_TW="建立", en_US="创建", en_GB="创建"), description="创建一场募选")
     @app_commands.rename(
@@ -219,8 +534,8 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
-            await interaction.response.send_message("无权限（需要 Manage Guild 或 Administrator）。", ephemeral=True)
+        if not await self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
@@ -298,7 +613,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -320,7 +635,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -359,7 +674,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -386,7 +701,7 @@ class ElectionGroup(app_commands.Group):
             fields = await self.cog.repo.list_fields(int(election["id"]))
             counts = await self.cog.repo.count_registrations_by_status(int(election["id"]))
             vote_count = await self.cog.repo.count_vote_records(int(election["id"]))
-            is_admin = isinstance(interaction.user, discord.Member) and is_election_admin(interaction.user)
+            is_admin = await self._admin(interaction)
             await interaction.response.send_message(
                 embed=build_status_embed(election, fields, counts, vote_count, is_admin_view=is_admin),
                 ephemeral=True,
@@ -418,7 +733,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -462,7 +777,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -497,7 +812,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -530,7 +845,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -547,7 +862,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         if not confirm:
@@ -575,7 +890,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         if not confirm:
@@ -599,7 +914,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -631,7 +946,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -649,7 +964,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -667,7 +982,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -685,7 +1000,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -706,7 +1021,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         election = await self.cog.repo.resolve_election(interaction.guild.id, election_id)
@@ -724,7 +1039,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         election = await self.cog.repo.resolve_election(interaction.guild.id, election_id)
@@ -744,7 +1059,7 @@ class ElectionGroup(app_commands.Group):
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
-        if not self._admin(interaction):
+        if not await self._admin(interaction):
             await interaction.response.send_message("无权限。", ephemeral=True)
             return
         logs = await self.cog.repo.list_audit_logs(interaction.guild.id, election_id=election_id, limit=max(1, min(50, limit)))
@@ -757,6 +1072,12 @@ class ElectionGroup(app_commands.Group):
     async def my_registration(self, interaction: discord.Interaction, election_id: int | None = None) -> None:
         await self.cog.show_my_registration(interaction, election_id=election_id)
 
+    @app_commands.command(name=locale_str("my_vote", zh_CN="我的投票", zh_TW="我的投票", en_US="我的投票", en_GB="我的投票"), description="查看我的投票情况")
+    @app_commands.rename(election_id=locale_str("election_id", zh_CN="募选id", zh_TW="募選id", en_US="募选id", en_GB="募选id"))
+    @app_commands.describe(election_id="募选 ID；不填时自动选择当前未完成募选")
+    async def my_vote(self, interaction: discord.Interaction, election_id: int | None = None) -> None:
+        await self.cog.show_my_vote(interaction, election_id=election_id)
+
     @app_commands.command(name=locale_str("help", zh_CN="帮助", zh_TW="幫助", en_US="帮助", en_GB="帮助"), description="募选系统帮助")
     async def help_cmd(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(embeds=build_help_embeds(), ephemeral=True)
@@ -766,9 +1087,11 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
     def __init__(self, bot):
         self.bot = bot
         self.repo = ElectionRepo(bot.db)
+        self.continuous_repo = ContinuousApplicationRepo(bot.db)
         self.publicity = PublicityService(bot, self.repo)
         self.result_service = ResultService(self.repo)
         self.vote_service = VoteService(bot, self.repo)
+        self.continuous = ContinuousApplicationService(bot, self.continuous_repo, self.repo)
         self.scheduler = ElectionScheduler(self)
         self.group = ElectionGroup(self)
         self._registered_guilds: list[discord.Object] = []
@@ -779,10 +1102,20 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
         else:
             bot.tree.add_command(self.group)
 
+    async def is_admin(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return False
+        role_ids = await self.repo.get_admin_role_ids(interaction.guild.id)
+        return is_election_admin(interaction.user, role_ids)
+
     async def cog_load(self) -> None:
         await self.repo.ensure_schema()
+        await self.continuous.ensure_schema()
         self.bot.add_view(RegistrationEntryView(cog=self))
         self.bot.add_view(VoteEntryView(cog=self))
+        self.bot.add_view(self.continuous.entry_view())
+        self.bot.add_view(self.continuous.vote_view(CONT_MODE_APPROVAL))
+        self.bot.add_view(self.continuous.vote_view(CONT_MODE_SUPPORT))
         self.scheduler.start()
         log.info("Election cog loaded")
 
@@ -1161,6 +1494,29 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
             await interaction.response.send_message(content[:1900], ephemeral=True)
         except Exception as exc:
             await interaction.response.send_message(f"查询失败：{exc}", ephemeral=True)
+
+    async def show_my_vote(self, interaction: discord.Interaction, election_id: int | None = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        try:
+            election = await self.repo.resolve_election(interaction.guild.id, election_id)
+            await self.vote_service.show_my_vote_status(interaction, election)
+        except Exception as exc:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"查询失败：{exc}", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            else:
+                await interaction.response.send_message(f"查询失败：{exc}", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    async def show_my_vote_from_vote_panel(self, interaction: discord.Interaction) -> None:
+        try:
+            election = await self._election_from_interaction_message(interaction, vote=True)
+            await self.vote_service.show_my_vote_status(interaction, election)
+        except Exception as exc:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"查询失败：{exc}", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            else:
+                await interaction.response.send_message(f"查询失败：{exc}", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     async def withdraw_registration(self, interaction: discord.Interaction) -> None:
         try:

@@ -31,7 +31,12 @@ from .constants import (
     VIS_PUBLIC,
     round_label,
 )
-from .embeds import build_case_review_embed, build_court_panel_embed, build_opening_post_embed
+from .embeds import (
+    build_case_review_embed,
+    build_court_panel_embed,
+    build_court_started_dm_content,
+    build_opening_post_embed,
+)
 from .services.audit import send_audit_log
 from .services.archive_export import build_archive
 from .services.db import CaseRepo, Database, GuildSettingsRepo
@@ -568,6 +573,65 @@ class CourtBot(commands.Bot):
         space = await self._create_case_channel(case, approved_visibility=approved_visibility)
         return space
 
+    async def _resolve_dm_user(self, guild: discord.Guild, user_id: int) -> Optional[discord.abc.User]:
+        member = guild.get_member(int(user_id))
+        if member is not None:
+            return member
+
+        try:
+            return await guild.fetch_member(int(user_id))
+        except Exception:
+            pass
+
+        try:
+            return await self.fetch_user(int(user_id))
+        except Exception:
+            return None
+
+    async def _notify_parties_court_started(
+        self,
+        *,
+        case: dict,
+        channel: discord.TextChannel,
+        approved_visibility: str,
+    ) -> list[str]:
+        court_url = f"https://discord.com/channels/{channel.guild.id}/{channel.id}"
+        content = build_court_started_dm_content(
+            case,
+            court_mention=channel.mention,
+            court_url=court_url,
+            approved_visibility=approved_visibility,
+        )
+
+        failures: list[str] = []
+        sent_user_ids: set[int] = set()
+        parties = (
+            ("投诉人", int(case["complainant_id"])),
+            ("被投诉人", int(case["defendant_id"])),
+        )
+        for label, user_id in parties:
+            if user_id in sent_user_ids:
+                continue
+            sent_user_ids.add(user_id)
+
+            user = await self._resolve_dm_user(channel.guild, user_id)
+            if user is None:
+                failures.append(f"{label} <@{user_id}>（无法读取用户）")
+                continue
+
+            try:
+                await user.send(content, allowed_mentions=discord.AllowedMentions.none())
+            except Exception as exc:
+                log.info("Failed to DM court start notice for case %s to %s", case.get("id"), user_id)
+                failures.append(f"{label} <@{user_id}>（{type(exc).__name__}）")
+
+        if failures:
+            await self.repo.log(int(case["id"]), "court_start_dm_failed", None, {"failures": failures})
+        else:
+            await self.repo.log(int(case["id"]), "court_start_dm_sent", None)
+
+        return failures
+
     async def _create_case_channel(self, case: dict, *, approved_visibility: str) -> Optional[discord.TextChannel]:
         guild = self.get_guild(int(case["guild_id"]))
         if guild is None:
@@ -704,11 +768,20 @@ class CourtBot(commands.Bot):
         panel_msg = await channel.send(embed=build_court_panel_embed(await self.repo.get_case(int(case["id"]))), view=view)
         await self.repo.set_court_panel_message(int(case["id"]), panel_msg.id)
 
+        dm_failures = await self._notify_parties_court_started(
+            case=case,
+            channel=channel,
+            approved_visibility=approved_visibility,
+        )
+        dm_status = "已私信双方当事人"
+        if dm_failures:
+            dm_status = "私信通知部分失败：" + "；".join(dm_failures)
+
         await send_audit_log(
             bot=self,
             audit_channel_id=settings.get("audit_log_channel_id"),
             title="创建议诉频道",
-            description=f"议诉 #{case['id']} 已创建频道（{vis_label}）：{channel.mention}",
+            description=f"议诉 #{case['id']} 已创建频道（{vis_label}）：{channel.mention}\n{dm_status}",
             case_id=int(case["id"]),
         )
 

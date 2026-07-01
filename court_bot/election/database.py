@@ -163,6 +163,13 @@ CREATE TABLE IF NOT EXISTS pe_audit_logs (
 
 CREATE INDEX IF NOT EXISTS idx_pe_audit_logs_election ON pe_audit_logs(election_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_pe_audit_logs_guild ON pe_audit_logs(guild_id, created_at);
+
+CREATE TABLE IF NOT EXISTS pe_guild_settings (
+  guild_id INTEGER PRIMARY KEY,
+  admin_role_ids TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 
@@ -233,6 +240,26 @@ class ElectionRepo:
     @staticmethod
     def encode_list(values: Iterable[Any]) -> str:
         return _json_dumps(list(values))
+
+    async def get_admin_role_ids(self, guild_id: int) -> list[int]:
+        row = await self.db.fetchone(
+            "SELECT admin_role_ids FROM pe_guild_settings WHERE guild_id=?",
+            (int(guild_id),),
+        )
+        return self.decode_role_ids(row["admin_role_ids"]) if row else []
+
+    async def set_admin_role_ids(self, guild_id: int, role_ids: list[int]) -> None:
+        now = utc_now_iso()
+        normalized = list(dict.fromkeys(int(role_id) for role_id in role_ids))
+        await self.db.execute_close(
+            """
+            INSERT INTO pe_guild_settings(guild_id, admin_role_ids, created_at, updated_at)
+            VALUES(?,?,?,?)
+            ON CONFLICT(guild_id)
+            DO UPDATE SET admin_role_ids=excluded.admin_role_ids, updated_at=excluded.updated_at
+            """,
+            (int(guild_id), _json_dumps(normalized), now, now),
+        )
 
     # ---------- create / read ----------
     async def create_election(
@@ -626,12 +653,26 @@ class ElectionRepo:
         )
         return row is not None
 
+    async def get_vote_record_for_voter(self, election_id: int, voter_id: int) -> dict[str, Any] | None:
+        row = await self.db.fetchone(
+            "SELECT * FROM pe_vote_records WHERE election_id=? AND voter_id=? ORDER BY id DESC LIMIT 1",
+            (int(election_id), int(voter_id)),
+        )
+        return dict(row) if row else None
+
     async def is_vote_invalidated(self, election_id: int, voter_id: int) -> bool:
         row = await self.db.fetchone(
             "SELECT 1 FROM pe_vote_invalidations WHERE election_id=? AND voter_id=? LIMIT 1",
             (int(election_id), int(voter_id)),
         )
         return row is not None
+
+    async def get_vote_invalidation(self, election_id: int, voter_id: int) -> dict[str, Any] | None:
+        row = await self.db.fetchone(
+            "SELECT * FROM pe_vote_invalidations WHERE election_id=? AND voter_id=? LIMIT 1",
+            (int(election_id), int(voter_id)),
+        )
+        return dict(row) if row else None
 
     async def add_vote_record(self, *, vote_id: int, election_id: int, voter_id: int, selected_user_ids: list[int]) -> None:
         if self.db.conn is None:

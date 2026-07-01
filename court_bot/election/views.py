@@ -164,12 +164,21 @@ class VoteEntryView(discord.ui.View):
     def __init__(self, *, cog):
         super().__init__(timeout=None)
         self.cog = cog
-        button = discord.ui.Button(label="开始投票", style=discord.ButtonStyle.primary, custom_id=f"{CUSTOM_ID_PREFIX}start_vote")
-        button.callback = self._on_start_vote
-        self.add_item(button)
+        start_button = discord.ui.Button(label="开始投票", style=discord.ButtonStyle.primary, custom_id=f"{CUSTOM_ID_PREFIX}start_vote")
+        my_vote_button = discord.ui.Button(label="我的投票", style=discord.ButtonStyle.secondary, custom_id=f"{CUSTOM_ID_PREFIX}my_vote")
+        start_button.callback = self._dispatch
+        my_vote_button.callback = self._dispatch
+        self.add_item(start_button)
+        self.add_item(my_vote_button)
 
-    async def _on_start_vote(self, interaction: discord.Interaction) -> None:
-        await self.cog.start_vote_interaction(interaction)
+    async def _dispatch(self, interaction: discord.Interaction) -> None:
+        custom_id = interaction.data.get("custom_id") if isinstance(interaction.data, dict) else ""
+        if custom_id.endswith("start_vote"):
+            await self.cog.start_vote_interaction(interaction)
+        elif custom_id.endswith("my_vote"):
+            await self.cog.show_my_vote_from_vote_panel(interaction)
+        else:
+            await interaction.response.send_message("未知投票入口按钮。", ephemeral=True)
 
 
 class VoteSelectionState:

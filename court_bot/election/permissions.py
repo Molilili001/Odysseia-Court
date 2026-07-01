@@ -3,16 +3,23 @@ from __future__ import annotations
 import discord
 
 
-def is_election_admin(member: discord.Member | discord.User | discord.abc.User) -> bool:
-    """Initial election admin rule: Administrator or Manage Guild.
-
-    This intentionally does not reuse court admin_role_ids or inspection owner/admin logic.
-    """
-
+def is_election_native_admin(member: discord.Member | discord.User | discord.abc.User) -> bool:
     if not isinstance(member, discord.Member):
         return False
     perms = member.guild_permissions
     return bool(perms.administrator or perms.manage_guild)
+
+
+def is_election_admin(member: discord.Member | discord.User | discord.abc.User, admin_role_ids: list[int] | tuple[int, ...] | set[int] | None = None) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    role_ids = [int(role_id) for role_id in (admin_role_ids or [])]
+    if not role_ids:
+        return is_election_native_admin(member)
+    if member.guild_permissions.administrator:
+        return True
+    allowed = set(role_ids)
+    return any(role.id in allowed for role in member.roles)
 
 
 def has_any_role(member: discord.Member, role_ids: list[int] | tuple[int, ...] | set[int]) -> bool:
