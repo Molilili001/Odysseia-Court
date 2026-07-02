@@ -5,10 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from court_bot.election.cog import parse_fields_config, parse_role_ids_from_text
+from court_bot.election.cog import ElectionGroup, parse_fields_config, parse_role_ids_from_text
 from court_bot.election.continuous_constants import (
     CONT_APP_APPROVED,
     CONT_APP_REJECTED,
+    CONT_APP_RETURNED,
     CONT_APP_VOTING,
     CONT_APP_WITHDRAWN,
     CONT_MODE_SUPPORT,
@@ -74,6 +75,11 @@ class FakeChannel:
         return self.message
 
 
+class FakeGuild:
+    def __init__(self, guild_id: int) -> None:
+        self.id = guild_id
+
+
 def make_fields(count: int) -> list[dict]:
     return [
         {
@@ -121,6 +127,17 @@ class ElectionPureFunctionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_continuous_fields_config("管理组,管理组")
 
+    def test_continuous_refresh_commands_are_registered(self) -> None:
+        group = ElectionGroup(object())
+        continuous = next(command for command in group.commands if command.name == "continuous")
+        command_names = {command.name for command in continuous.commands}
+        self.assertIn("refresh_entry", command_names)
+        self.assertIn("refresh_display", command_names)
+
+        refresh_display = next(command for command in continuous.commands if command.name == "refresh_display")
+        scope = next(param for param in refresh_display.parameters if param.name == "scope")
+        self.assertEqual([choice.value for choice in scope.choices], ["auto", "all", "entry", "vote"])
+
     def test_continuous_application_result_thresholds(self) -> None:
         passed = calculate_application_result(yes_votes=6, no_votes=4, min_total_votes=10, approval_threshold_percent=60)
         self.assertTrue(passed["passed"])
@@ -135,7 +152,7 @@ class ElectionPureFunctionTests(unittest.TestCase):
         self.assertEqual(support["support_votes"], 3)
         self.assertFalse(calculate_support_collection_result(support_votes=2, support_target_votes=3)["passed"])
 
-    def test_continuous_application_embed_does_not_expand_user_identity(self) -> None:
+    def test_continuous_application_embed_uses_display_identity_fields(self) -> None:
         embed = build_continuous_application_embed(
             {"id": 1, "name": "常态申请", "mode": CONT_MODE_SUPPORT},
             {
@@ -150,11 +167,10 @@ class ElectionPureFunctionTests(unittest.TestCase):
             },
         )
         fields = {field.name: field.value for field in embed.fields}
-        self.assertEqual(fields["申请人"], "<@123456789>")
-        all_text = "\n".join(str(value) for value in fields.values())
-        self.assertNotIn("申请人昵称", all_text)
-        self.assertNotIn("unique_user", all_text)
-        self.assertNotIn("用户 ID", all_text)
+        self.assertEqual(fields["👤 候选人"], "申请人昵称")
+        self.assertEqual(fields["🏷️ 用户名"], "`unique_user`")
+        self.assertEqual(fields["🔗 提及"], "<@123456789>")
+        self.assertNotIn("🆔 用户 ID", fields)
 
     def test_continuous_support_failure_display_keeps_vote_count_private(self) -> None:
         async def run() -> None:
@@ -635,6 +651,82 @@ class ElectionRepoAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.cont_repo.get_active_cooldown(config_id, 1, utc_now_iso()), cooldown_until)
         with self.assertRaises(ValueError):
             await self.cont_repo.upsert_vote_record(application=app, voter_id=502, choice=CONT_VOTE_YES)
+
+    async def test_continuous_admin_return_allows_resubmit_but_reject_sets_cooldown(self) -> None:
+        config_id = await self.cont_repo.create_config(
+            guild_id=100,
+            name="常态申请",
+            entry_channel_id=10,
+            voting_channel_id=11,
+            public_channel_id=12,
+            allowed_application_role_ids=[],
+            allowed_voter_role_ids=[],
+            min_total_votes=1,
+            approval_threshold_percent=51,
+            voting_duration_minutes=60,
+            cooldown_minutes=1440,
+            created_by=999,
+            fields=["管理组"],
+        )
+        config = await self.cont_repo.get_config(config_id)
+        assert config is not None
+        fields = await self.cont_repo.list_fields(config_id)
+        service = ContinuousApplicationService(bot=None, repo=self.cont_repo)
+
+        async def fake_edit_vote_message(config, application, *, result=None):
+            return True
+
+        async def fake_publish_event(config, application, event, *, result=None):
+            return True
+
+        service._edit_vote_message = fake_edit_vote_message
+        service._publish_event = fake_publish_event
+        guild = FakeGuild(100)
+
+        first_id = await self.cont_repo.create_application(
+            config=config,
+            user_id=30,
+            display_name="申请人30",
+            username="applicant30",
+            field_key=str(fields[0]["field_key"]),
+            field_name=str(fields[0]["name"]),
+            self_intro="需要修改的宣言",
+            voting_end_at="2099-05-01T13:00:00+00:00",
+        )
+        await service.manual_return_application(guild=guild, application_id=first_id, operator_id=999, reason="请补充说明")
+        returned = await self.cont_repo.get_application(first_id)
+        assert returned is not None
+        self.assertEqual(returned["status"], CONT_APP_RETURNED)
+        self.assertIsNone(returned["cooldown_until"])
+        self.assertIsNone(await self.cont_repo.get_active_cooldown(config_id, 30, utc_now_iso()))
+
+        second_id = await self.cont_repo.create_application(
+            config=config,
+            user_id=30,
+            display_name="申请人30",
+            username="applicant30",
+            field_key=str(fields[0]["field_key"]),
+            field_name=str(fields[0]["name"]),
+            self_intro="修改后的宣言",
+            voting_end_at="2099-05-02T13:00:00+00:00",
+        )
+        await service.manual_reject_application(guild=guild, application_id=second_id, operator_id=999, reason="不符合要求")
+        rejected = await self.cont_repo.get_application(second_id)
+        assert rejected is not None
+        self.assertEqual(rejected["status"], CONT_APP_REJECTED)
+        self.assertIsNotNone(rejected["cooldown_until"])
+        self.assertEqual(await self.cont_repo.get_active_cooldown(config_id, 30, utc_now_iso()), rejected["cooldown_until"])
+        with self.assertRaises(ValueError):
+            await self.cont_repo.create_application(
+                config=config,
+                user_id=30,
+                display_name="申请人30",
+                username="applicant30",
+                field_key=str(fields[0]["field_key"]),
+                field_name=str(fields[0]["name"]),
+                self_intro="冷却期内重提",
+                voting_end_at="2099-05-03T13:00:00+00:00",
+            )
 
     async def test_continuous_repo_rejects_expired_votes_and_finalizes_atomically(self) -> None:
         config_id = await self.cont_repo.create_config(

@@ -315,6 +315,67 @@ class ContinuousElectionGroup(app_commands.Group):
         except Exception as exc:
             await interaction.edit_original_response(content=f"发送入口失败：{exc}")
 
+    @app_commands.command(name=locale_str("refresh_entry", zh_CN="刷新入口", zh_TW="刷新入口", en_US="refresh_entry", en_GB="refresh_entry"), description="原地刷新已发送的常态申请入口")
+    @app_commands.rename(config_id=locale_str("config_id", zh_CN="配置id", zh_TW="配置id", en_US="配置id", en_GB="配置id"))
+    @app_commands.describe(config_id="常态申请配置 ID；不填时若只有一个配置则自动选择")
+    async def refresh_entry(self, interaction: discord.Interaction, config_id: int | None = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not await self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            config = await self.cog.continuous_repo.resolve_config(interaction.guild.id, config_id)
+            refreshed = await self.cog.continuous.refresh_entry(config, reason="manual_refresh_entry", operator_id=interaction.user.id)
+            if not refreshed:
+                await interaction.edit_original_response(
+                    content=(
+                        "刷新失败：该常态申请尚未记录入口消息，或 Bot 无法读取/编辑原消息。"
+                        "如需重新生成入口，可使用 /募选 常态 入口。"
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            await interaction.edit_original_response(content=f"已刷新常态申请配置 #{config['id']} 的入口。")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"刷新失败：{exc}")
+
+    @app_commands.command(name=locale_str("refresh_display", zh_CN="刷新展示", zh_TW="刷新展示", en_US="refresh_display", en_GB="refresh_display"), description="原地刷新常态申请入口和投票面板")
+    @app_commands.choices(
+        scope=[
+            Choice(name="自动", value="auto"),
+            Choice(name="全部", value="all"),
+            Choice(name="入口", value="entry"),
+            Choice(name="投票面板", value="vote"),
+        ]
+    )
+    @app_commands.rename(
+        config_id=locale_str("config_id", zh_CN="配置id", zh_TW="配置id", en_US="配置id", en_GB="配置id"),
+        scope=locale_str("scope", zh_CN="范围", zh_TW="範圍", en_US="范围", en_GB="范围"),
+    )
+    @app_commands.describe(config_id="常态申请配置 ID；不填时若只有一个配置则自动选择", scope="刷新范围；不填默认刷新入口和投票面板")
+    async def refresh_display(self, interaction: discord.Interaction, config_id: int | None = None, scope: Choice[str] | None = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not await self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            config = await self.cog.continuous_repo.resolve_config(interaction.guild.id, config_id)
+            report = await self.cog.continuous.refresh_display_messages(
+                interaction.guild.id,
+                config,
+                scope=str(scope.value) if scope else "auto",
+                operator_id=interaction.user.id,
+            )
+            await interaction.edit_original_response(content=report[:1900], allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"刷新展示失败：{exc}")
+
     @app_commands.command(name=locale_str("status", zh_CN="状态", zh_TW="狀態", en_US="状态", en_GB="状态"), description="查看常态申请配置状态")
     @app_commands.rename(config_id=locale_str("config_id", zh_CN="配置id", zh_TW="配置id", en_US="配置id", en_GB="配置id"))
     @app_commands.describe(config_id="常态申请配置 ID；不填则列出全部常态配置")
@@ -370,13 +431,13 @@ class ContinuousElectionGroup(app_commands.Group):
         except Exception as exc:
             await interaction.edit_original_response(content=f"结算失败：{exc}")
 
-    @app_commands.command(name=locale_str("cancel", zh_CN="取消申请", zh_TW="取消申請", en_US="取消申请", en_GB="取消申请"), description="管理员取消一条投票中的常态申请")
+    @app_commands.command(name=locale_str("return_for_revision", zh_CN="打回申请需要修改", zh_TW="打回申請需修改", en_US="return_for_revision", en_GB="return_for_revision"), description="管理员打回一条投票中的常态申请，允许申请人修改后重新提交")
     @app_commands.rename(
         application_id=locale_str("application_id", zh_CN="申请id", zh_TW="申請id", en_US="申请id", en_GB="申请id"),
         reason=locale_str("reason", zh_CN="原因", zh_TW="原因", en_US="原因", en_GB="原因"),
     )
-    @app_commands.describe(application_id="要取消的常态申请 ID", reason="取消原因")
-    async def cancel(self, interaction: discord.Interaction, application_id: int, reason: str | None = None) -> None:
+    @app_commands.describe(application_id="要打回的常态申请 ID", reason="打回原因")
+    async def return_for_revision(self, interaction: discord.Interaction, application_id: int, reason: str | None = None) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
             return
@@ -385,10 +446,30 @@ class ContinuousElectionGroup(app_commands.Group):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            await self.cog.continuous.manual_cancel_application(guild=interaction.guild, application_id=application_id, operator_id=interaction.user.id, reason=reason)
-            await interaction.edit_original_response(content="已取消该常态申请。")
+            await self.cog.continuous.manual_return_application(guild=interaction.guild, application_id=application_id, operator_id=interaction.user.id, reason=reason)
+            await interaction.edit_original_response(content="已打回该常态申请，申请人可修改后重新提交。")
         except Exception as exc:
-            await interaction.edit_original_response(content=f"取消失败：{exc}")
+            await interaction.edit_original_response(content=f"打回失败：{exc}")
+
+    @app_commands.command(name=locale_str("reject_to_cooldown", zh_CN="拒绝申请进入冷却", zh_TW="拒絕申請進入冷卻", en_US="reject_to_cooldown", en_GB="reject_to_cooldown"), description="管理员拒绝一条投票中的常态申请，并写入冷却期")
+    @app_commands.rename(
+        application_id=locale_str("application_id", zh_CN="申请id", zh_TW="申請id", en_US="申请id", en_GB="申请id"),
+        reason=locale_str("reason", zh_CN="原因", zh_TW="原因", en_US="原因", en_GB="原因"),
+    )
+    @app_commands.describe(application_id="要拒绝的常态申请 ID", reason="拒绝原因")
+    async def reject_to_cooldown(self, interaction: discord.Interaction, application_id: int, reason: str | None = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not await self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await self.cog.continuous.manual_reject_application(guild=interaction.guild, application_id=application_id, operator_id=interaction.user.id, reason=reason)
+            await interaction.edit_original_response(content="已拒绝该常态申请，并按配置写入冷却期。")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"拒绝失败：{exc}")
 
     @app_commands.command(name=locale_str("remove_approved", zh_CN="移除通过", zh_TW="移除通過", en_US="移除通过", en_GB="移除通过"), description="管理员将成员移出常态申请通过名单")
     @app_commands.rename(

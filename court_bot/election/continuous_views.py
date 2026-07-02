@@ -6,6 +6,29 @@ import discord
 
 from .constants import MAX_SELF_INTRO_LENGTH
 from .continuous_constants import CONTINUOUS_CUSTOM_ID_PREFIX, CONT_MODE_APPROVAL, CONT_MODE_SUPPORT, CONT_VOTE_NO, CONT_VOTE_YES
+from .text_utils import sanitize_public_text
+from .time_utils import format_beijing
+
+
+CONTINUOUS_APPLICATION_LIST_PAGE_SIZE = 10
+
+
+def _application_list_total_pages(applications: list[dict[str, Any]], page_size: int) -> int:
+    return max(1, (len(applications) + int(page_size) - 1) // int(page_size))
+
+
+def _application_option_label(application: dict[str, Any]) -> str:
+    fallback = str(int(application.get("user_id") or 0)) if application.get("user_id") else "未知用户"
+    display_name = sanitize_public_text(application.get("display_name"), max_len=54, fallback=fallback)
+    field_name = sanitize_public_text(application.get("field_name"), max_len=40, fallback="未选择岗位")
+    label = f"{display_name}｜{field_name}"
+    return label[:100] or fallback[:100]
+
+
+def _application_option_description(application: dict[str, Any]) -> str:
+    user_id = int(application.get("user_id") or 0)
+    deadline = format_beijing(application.get("voting_end_at"), fallback="未设置")
+    return f"ID: {user_id}｜截止 {deadline}"[:100]
 
 
 class ContinuousApplicationModal(discord.ui.Modal):
@@ -70,12 +93,15 @@ class ContinuousEntryView(discord.ui.View):
         apply_button = discord.ui.Button(label="提交申请", style=discord.ButtonStyle.success, custom_id=f"{CONTINUOUS_CUSTOM_ID_PREFIX}apply")
         status_button = discord.ui.Button(label="我的申请", style=discord.ButtonStyle.secondary, custom_id=f"{CONTINUOUS_CUSTOM_ID_PREFIX}my_status")
         exit_button = discord.ui.Button(label="退出申请", style=discord.ButtonStyle.danger, custom_id=f"{CONTINUOUS_CUSTOM_ID_PREFIX}exit")
+        list_button = discord.ui.Button(label="当前报名人名单", style=discord.ButtonStyle.primary, custom_id=f"{CONTINUOUS_CUSTOM_ID_PREFIX}current_applicants")
         apply_button.callback = self._dispatch
         status_button.callback = self._dispatch
         exit_button.callback = self._dispatch
+        list_button.callback = self._dispatch
         self.add_item(apply_button)
         self.add_item(status_button)
         self.add_item(exit_button)
+        self.add_item(list_button)
 
     async def _dispatch(self, interaction: discord.Interaction) -> None:
         custom_id = interaction.data.get("custom_id") if isinstance(interaction.data, dict) else ""
@@ -85,8 +111,104 @@ class ContinuousEntryView(discord.ui.View):
             await self.service.show_my_status_from_entry(interaction)
         elif custom_id.endswith("exit"):
             await self.service.request_exit_from_entry(interaction)
+        elif custom_id.endswith("current_applicants"):
+            await self.service.show_current_applications_from_entry(interaction)
         else:
             await interaction.response.send_message("未知常态申请入口按钮。", ephemeral=True)
+
+
+class ContinuousApplicationListView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        service,
+        config: dict[str, Any],
+        applications: list[dict[str, Any]],
+        page: int = 0,
+        requester_id: int,
+        page_size: int = CONTINUOUS_APPLICATION_LIST_PAGE_SIZE,
+    ):
+        super().__init__(timeout=300)
+        self.service = service
+        self.config = config
+        self.config_id = int(config["id"])
+        self.page_size = int(page_size)
+        self.total_pages = _application_list_total_pages(applications, self.page_size)
+        self.page = min(max(0, int(page)), self.total_pages - 1)
+        self.requester_id = int(requester_id)
+        start = self.page * self.page_size
+        rows = applications[start : start + self.page_size]
+        if rows:
+            select = discord.ui.Select(
+                placeholder="选择报名人，查看对应投票链接",
+                min_values=1,
+                max_values=1,
+                options=[
+                    discord.SelectOption(
+                        label=_application_option_label(app),
+                        description=_application_option_description(app),
+                        value=str(int(app.get("id") or 0)),
+                    )
+                    for app in rows
+                ],
+            )
+            select.callback = self._select_application
+            self.add_item(select)
+
+        if self.total_pages > 1:
+            previous_button = discord.ui.Button(label="上一页", style=discord.ButtonStyle.secondary, disabled=self.page <= 0)
+            next_button = discord.ui.Button(label="下一页", style=discord.ButtonStyle.secondary, disabled=self.page >= self.total_pages - 1)
+            previous_button.callback = self._previous_page
+            next_button.callback = self._next_page
+            self.add_item(previous_button)
+            self.add_item(next_button)
+
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) == self.requester_id:
+            return True
+        await interaction.response.send_message("这不是你的报名人名单面板。", ephemeral=True)
+        return False
+
+    async def _select_application(self, interaction: discord.Interaction) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        values = interaction.data.get("values", []) if isinstance(interaction.data, dict) else []
+        application_id = int(values[0]) if values else 0
+        if not application_id:
+            await interaction.response.send_message("请选择一个报名人。", ephemeral=True)
+            return
+        await self.service.show_application_detail_from_list(
+            interaction,
+            config_id=self.config_id,
+            application_id=application_id,
+        )
+
+    async def _previous_page(self, interaction: discord.Interaction) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        await self.service.show_current_applications_page(
+            interaction,
+            config_id=self.config_id,
+            page=self.page - 1,
+            requester_id=self.requester_id,
+        )
+
+    async def _next_page(self, interaction: discord.Interaction) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        await self.service.show_current_applications_page(
+            interaction,
+            config_id=self.config_id,
+            page=self.page + 1,
+            requester_id=self.requester_id,
+        )
+
+
+class ContinuousApplicationJumpView(discord.ui.View):
+    def __init__(self, *, jump_url: str | None):
+        super().__init__(timeout=300)
+        if jump_url:
+            self.add_item(discord.ui.Button(label="跳转投票消息", style=discord.ButtonStyle.link, url=jump_url))
 
 
 class ContinuousVoteView(discord.ui.View):

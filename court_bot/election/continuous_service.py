@@ -11,6 +11,8 @@ from .continuous_constants import (
     CONT_APP_APPROVED,
     CONT_APP_APPROVED_WITHDRAWN,
     CONT_APP_CANCELLED,
+    CONT_APP_REJECTED,
+    CONT_APP_RETURNED,
     CONT_APP_VOTING,
     CONT_APP_WITHDRAWN,
     CONT_MODE_APPROVAL,
@@ -21,6 +23,8 @@ from .continuous_constants import (
 from .continuous_database import ContinuousApplicationRepo
 from .continuous_embeds import (
     build_continuous_application_embed,
+    build_continuous_application_list_embed,
+    build_continuous_application_lookup_embed,
     build_continuous_approved_list_embed,
     build_continuous_entry_embed,
     build_continuous_my_status_embed,
@@ -29,7 +33,15 @@ from .continuous_embeds import (
     build_continuous_supporter_list_embeds,
     build_continuous_vote_status_embed,
 )
-from .continuous_views import ContinuousEntryView, ContinuousExitConfirmView, ContinuousFieldSelectView, ContinuousVoteView
+from .continuous_views import (
+    CONTINUOUS_APPLICATION_LIST_PAGE_SIZE,
+    ContinuousApplicationJumpView,
+    ContinuousApplicationListView,
+    ContinuousEntryView,
+    ContinuousExitConfirmView,
+    ContinuousFieldSelectView,
+    ContinuousVoteView,
+)
 from .embeds import format_role_mentions
 from .permissions import has_any_role
 from .text_utils import contains_forbidden_mention, sanitize_public_text
@@ -52,6 +64,15 @@ class ContinuousApplicationService:
 
     def vote_view(self, mode: str = CONT_MODE_APPROVAL) -> ContinuousVoteView:
         return ContinuousVoteView(service=self, mode=mode)
+
+    @staticmethod
+    def _application_jump_url(config: dict[str, Any], application: dict[str, Any]) -> str | None:
+        guild_id = int(application.get("guild_id") or config.get("guild_id") or 0)
+        channel_id = int(application.get("vote_channel_id") or config.get("voting_channel_id") or 0)
+        message_id = int(application.get("vote_message_id") or 0)
+        if not guild_id or not channel_id or not message_id:
+            return None
+        return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
 
     def _config_mode(self, config: dict[str, Any] | None) -> str:
         return str((config or {}).get("mode") or CONT_MODE_APPROVAL)
@@ -102,7 +123,7 @@ class ContinuousApplicationService:
         await self.repo.set_entry_message(int(config["id"]), int(msg.id), int(channel.id))
         return msg
 
-    async def refresh_entry(self, config: dict[str, Any]) -> bool:
+    async def refresh_entry(self, config: dict[str, Any], *, reason: str | None = None, operator_id: int | None = None) -> bool:
         channel = await self._get_text_channel(int(config.get("entry_channel_id") or 0))
         message_id = int(config.get("entry_message_id") or 0)
         if channel is None or not message_id:
@@ -116,6 +137,7 @@ class ContinuousApplicationService:
                 view=self.entry_view(),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+            await self._log(int(fresh["guild_id"]), operator_id, "continuous_entry_refreshed", {"config_id": int(fresh["id"]), "reason": reason})
             return True
         except Exception:
             log.exception("Failed to refresh continuous entry for config %s", config.get("id"))
@@ -241,6 +263,127 @@ class ContinuousApplicationService:
         cooldown_until = await self.repo.get_active_cooldown(int(config["id"]), int(interaction.user.id), utc_now_iso())
         await interaction.response.send_message(
             embed=build_continuous_my_status_embed(config, latest, cooldown_until=cooldown_until),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _current_application_list_payload(
+        self,
+        config: dict[str, Any],
+        *,
+        page: int,
+        requester_id: int,
+    ) -> tuple[discord.Embed, discord.ui.View | None]:
+        applications = await self.repo.list_open_applications(int(config["id"]))
+        embed = build_continuous_application_list_embed(
+            config,
+            applications,
+            page=page,
+            page_size=CONTINUOUS_APPLICATION_LIST_PAGE_SIZE,
+        )
+        view = (
+            ContinuousApplicationListView(
+                service=self,
+                config=config,
+                applications=applications,
+                page=page,
+                requester_id=int(requester_id),
+                page_size=CONTINUOUS_APPLICATION_LIST_PAGE_SIZE,
+            )
+            if applications
+            else None
+        )
+        return embed, view
+
+    async def finalize_due_applications_for_config(self, config_id: int) -> int:
+        due = await self.repo.list_due_applications_for_config(int(config_id), utc_now_iso())
+        completed = 0
+        for application in due:
+            try:
+                await self.finalize_application(application, operator_id=None)
+                completed += 1
+            except Exception:
+                log.exception("Failed to finalize continuous application %s", application.get("id"))
+        return completed
+
+    async def show_current_applications_from_entry(self, interaction: discord.Interaction) -> None:
+        try:
+            config = await self._config_from_entry_interaction(interaction)
+        except Exception as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.finalize_due_applications_for_config(int(config["id"]))
+        fresh = await self.repo.get_config(int(config["id"])) or config
+        embed, view = await self._current_application_list_payload(
+            fresh,
+            page=0,
+            requester_id=int(interaction.user.id),
+        )
+        await interaction.edit_original_response(
+            content=None,
+            embed=embed,
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def show_current_applications_page(
+        self,
+        interaction: discord.Interaction,
+        *,
+        config_id: int,
+        page: int,
+        requester_id: int,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        config = await self.repo.get_config(int(config_id))
+        if not config or int(config.get("guild_id") or 0) != int(interaction.guild.id):
+            await interaction.response.send_message("未找到常态申请配置。", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=False)
+        await self.finalize_due_applications_for_config(int(config["id"]))
+        embed, view = await self._current_application_list_payload(
+            config,
+            page=page,
+            requester_id=int(requester_id),
+        )
+        await interaction.edit_original_response(
+            content=None,
+            embed=embed,
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def show_application_detail_from_list(self, interaction: discord.Interaction, *, config_id: int, application_id: int) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        config = await self.repo.get_config(int(config_id))
+        application = await self.repo.get_application(int(application_id))
+        if not config or int(config.get("guild_id") or 0) != int(interaction.guild.id):
+            await interaction.followup.send("未找到常态申请配置。", ephemeral=True)
+            return
+        if not application or int(application.get("config_id") or 0) != int(config["id"]) or int(application.get("guild_id") or 0) != int(interaction.guild.id):
+            await interaction.followup.send("未找到该报名记录。", ephemeral=True)
+            return
+
+        vote_end = parse_iso(application.get("voting_end_at"))
+        if application.get("status") == CONT_APP_VOTING and vote_end is not None and utc_now() >= vote_end:
+            await self.finalize_application(application, operator_id=None)
+            application = await self.repo.get_application(int(application_id)) or application
+
+        jump_url = self._application_jump_url(config, application)
+        embed = build_continuous_application_lookup_embed(config, application, jump_url=jump_url)
+        view = ContinuousApplicationJumpView(jump_url=jump_url) if jump_url else None
+        await interaction.followup.send(
+            embed=embed,
+            view=view,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -563,15 +706,59 @@ class ContinuousApplicationService:
             message = await channel.fetch_message(message_id)
             final_result = result if result is not None else ContinuousApplicationRepo.decode_result(application.get("result_json"))
             display_result = final_result if final_result.get("total_votes") is not None else None
+            view = self.vote_view(self._config_mode(config)) if str(application.get("status") or "") == CONT_APP_VOTING else None
             await message.edit(
                 embed=build_continuous_application_embed(config, application, result=display_result),
-                view=None,
+                view=view,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return True
         except Exception:
             log.exception("Failed to edit continuous vote message for application %s", application.get("id"))
             return False
+
+    async def _refresh_vote_displays(self, config: dict[str, Any]) -> list[str]:
+        applications = await self.repo.list_open_applications(int(config["id"]))
+        if not applications:
+            return ["投票面板：当前没有进行中的申请。"]
+
+        success = 0
+        failed: list[int] = []
+        for application in applications:
+            ok = await self._edit_vote_message(config, application)
+            if ok:
+                success += 1
+            else:
+                failed.append(int(application.get("id") or 0))
+
+        lines = [f"投票面板：进行中 {len(applications)}，成功 {success}，失败 {len(failed)}。"]
+        if failed:
+            lines.append("未刷新申请 ID：" + "、".join(str(app_id) for app_id in failed[:20]))
+        return lines
+
+    async def refresh_display_messages(
+        self,
+        guild_id: int,
+        config: dict[str, Any],
+        *,
+        scope: str = "auto",
+        operator_id: int | None = None,
+    ) -> str:
+        scope = str(scope or "auto")
+        valid_scopes = {"auto", "all", "entry", "vote"}
+        if scope not in valid_scopes:
+            raise ValueError("未知刷新范围。")
+
+        scopes = ["entry", "vote"] if scope in ("auto", "all") else [scope]
+        fresh = await self.repo.get_config(int(config["id"])) or config
+        lines = [f"刷新展示｜常态申请 #{fresh['id']}《{sanitize_public_text(fresh.get('name'), max_len=120)}》", f"范围：{scope}"]
+        if "entry" in scopes:
+            ok = await self.refresh_entry(fresh, reason="manual_refresh_display", operator_id=operator_id)
+            lines.append("入口面板：" + ("成功。" if ok else "未刷新（未记录入口消息或无法编辑）。"))
+        if "vote" in scopes:
+            lines.extend(await self._refresh_vote_displays(fresh))
+        await self._log(int(guild_id), operator_id, "continuous_display_refreshed", {"config_id": int(fresh["id"]), "scope": scope, "scopes": scopes})
+        return "\n".join(lines)
 
     async def _publish_event(self, config: dict[str, Any], application: dict[str, Any], event: str, *, result: dict[str, Any] | None = None) -> bool:
         channel = await self._get_text_channel(int(config.get("public_channel_id") or 0))
@@ -659,27 +846,51 @@ class ContinuousApplicationService:
         )
         return build_continuous_approved_list_embed(rows, config=config, field_name=field_name)
 
-    async def manual_cancel_application(self, *, guild: discord.Guild, application_id: int, operator_id: int, reason: str | None = None) -> None:
+    async def manual_return_application(self, *, guild: discord.Guild, application_id: int, operator_id: int, reason: str | None = None) -> None:
         application = await self.repo.get_application(int(application_id))
         if not application or int(application.get("guild_id") or 0) != int(guild.id):
             raise ValueError("未找到该申请，或该申请不属于当前服务器。")
         if application.get("status") != CONT_APP_VOTING:
-            raise ValueError("只有投票中的申请可以取消。")
+            raise ValueError("只有投票中的申请可以打回。")
         config = await self.repo.get_config(int(application["config_id"]))
         if not config:
             raise ValueError("未找到常态申请配置。")
         changed = await self.repo.set_application_status(
             int(application["id"]),
-            CONT_APP_CANCELLED,
-            reason=reason or "管理员取消",
+            CONT_APP_RETURNED,
+            reason=reason or "管理员打回，需修改后重新提交",
             expected_status=CONT_APP_VOTING,
         )
         if not changed:
-            raise ValueError("该申请已不在投票中，无法取消。")
+            raise ValueError("该申请已不在投票中，无法打回。")
         updated = await self.repo.get_application(int(application["id"])) or application
         await self._edit_vote_message(config, updated)
-        await self._publish_event(config, updated, "管理员已取消该申请。", result=None)
-        await self._log(guild.id, operator_id, "continuous_application_cancelled", {"application_id": int(application_id), "reason": reason})
+        await self._publish_event(config, updated, "管理员已打回该申请，申请人可修改后重新提交。", result=None)
+        await self._log(guild.id, operator_id, "continuous_application_returned", {"application_id": int(application_id), "reason": reason})
+
+    async def manual_reject_application(self, *, guild: discord.Guild, application_id: int, operator_id: int, reason: str | None = None) -> None:
+        application = await self.repo.get_application(int(application_id))
+        if not application or int(application.get("guild_id") or 0) != int(guild.id):
+            raise ValueError("未找到该申请，或该申请不属于当前服务器。")
+        if application.get("status") != CONT_APP_VOTING:
+            raise ValueError("只有投票中的申请可以拒绝。")
+        config = await self.repo.get_config(int(application["config_id"]))
+        if not config:
+            raise ValueError("未找到常态申请配置。")
+        cooldown_until = self._cooldown_until(config)
+        changed = await self.repo.set_application_status(
+            int(application["id"]),
+            CONT_APP_REJECTED,
+            reason=reason or "管理员拒绝",
+            cooldown_until=cooldown_until,
+            expected_status=CONT_APP_VOTING,
+        )
+        if not changed:
+            raise ValueError("该申请已不在投票中，无法拒绝。")
+        updated = await self.repo.get_application(int(application["id"])) or application
+        await self._edit_vote_message(config, updated)
+        await self._publish_event(config, updated, "管理员已拒绝该申请，申请人进入冷却期。", result=None)
+        await self._log(guild.id, operator_id, "continuous_application_rejected", {"application_id": int(application_id), "reason": reason, "cooldown_until": cooldown_until})
 
     async def manual_remove_approved(
         self,

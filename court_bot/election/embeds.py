@@ -609,6 +609,16 @@ def build_help_embeds() -> list[discord.Embed]:
         inline=False,
     )
     setup.add_field(
+        name="/募选 常态 入口、刷新入口、刷新展示",
+        value=(
+            "`入口`：发送或重发长期申请入口。\n"
+            "`刷新入口`：原地编辑已记录的常态申请入口，不重发新消息。\n"
+            "`刷新展示`：按范围刷新常态入口和进行中的申请投票面板。\n"
+            "范围：自动、全部、入口、投票面板。"
+        ),
+        inline=False,
+    )
+    setup.add_field(
         name="/募选 状态、/募选 列表",
         value=(
             "`/募选 状态`：查看阶段、岗位、报名资格、投票资格、时间、统计、公示状态。\n"

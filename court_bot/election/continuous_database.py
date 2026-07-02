@@ -491,6 +491,17 @@ class ContinuousApplicationRepo:
         )
         return [dict(row) for row in rows]
 
+    async def list_due_applications_for_config(self, config_id: int, now_iso: str) -> list[dict[str, Any]]:
+        rows = await self.db.fetchall(
+            """
+            SELECT * FROM pe_continuous_applications
+            WHERE config_id=? AND status=? AND voting_end_at<=?
+            ORDER BY voting_end_at ASC, id ASC
+            """,
+            (int(config_id), CONT_APP_VOTING, now_iso),
+        )
+        return [dict(row) for row in rows]
+
     async def list_open_applications(self, config_id: int) -> list[dict[str, Any]]:
         rows = await self.db.fetchall(
             """

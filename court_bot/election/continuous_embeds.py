@@ -10,6 +10,7 @@ from .continuous_constants import (
     CONT_APP_APPROVED_WITHDRAWN,
     CONT_APP_CANCELLED,
     CONT_APP_REJECTED,
+    CONT_APP_RETURNED,
     CONT_APP_VOTING,
     CONT_APP_WITHDRAWN,
     CONT_APPLICATION_STATUS_LABELS,
@@ -20,9 +21,9 @@ from .continuous_constants import (
     CONT_VOTE_SUPPORT,
 )
 from .continuous_database import ContinuousApplicationRepo
-from .embeds import format_role_mentions
+from .embeds import format_discord_username, format_role_mentions
 from .text_utils import sanitize_public_text, split_lines_for_embed
-from .time_utils import format_time_pair, human_duration
+from .time_utils import format_discord_ts, format_time_pair, human_duration
 
 
 def _format_percent(value: object) -> str:
@@ -38,6 +39,11 @@ def _format_percent(value: object) -> str:
 def _format_user(app: dict[str, Any]) -> str:
     user_id = int(app.get("user_id") or 0)
     return f"<@{user_id}>" if user_id else "未知用户"
+
+
+def _format_display_name(app: dict[str, Any]) -> str:
+    fallback = str(int(app.get("user_id") or 0)) if app.get("user_id") else "未知用户"
+    return sanitize_public_text(app.get("display_name"), max_len=100, fallback=fallback)
 
 
 def _config_mode(config: dict[str, Any]) -> str:
@@ -83,14 +89,16 @@ def build_continuous_application_embed(
         color = COLOR_GREEN
     elif status == CONT_APP_REJECTED:
         color = COLOR_RED
-    elif status in (CONT_APP_WITHDRAWN, CONT_APP_APPROVED_WITHDRAWN, CONT_APP_CANCELLED):
+    elif status in (CONT_APP_RETURNED, CONT_APP_WITHDRAWN, CONT_APP_APPROVED_WITHDRAWN, CONT_APP_CANCELLED):
         color = COLOR_GRAY
     else:
         color = COLOR_ORANGE
     mode = _config_mode(config)
     title = f"常态申请{'投票' if mode == CONT_MODE_APPROVAL else '支持收集'}｜{sanitize_public_text(config.get('name'), max_len=120)}"
     embed = discord.Embed(title=title, color=color)
-    embed.add_field(name="申请人", value=_format_user(application), inline=False)
+    embed.add_field(name="👤 候选人", value=_format_display_name(application), inline=True)
+    embed.add_field(name="🏷️ 用户名", value=format_discord_username(application.get("username")), inline=True)
+    embed.add_field(name="🔗 提及", value=_format_user(application), inline=True)
     embed.add_field(name="申请岗位", value=sanitize_public_text(application.get("field_name"), max_len=80), inline=True)
     embed.add_field(name="当前状态", value=CONT_APPLICATION_STATUS_LABELS.get(status, status), inline=True)
     embed.add_field(name="投票结束", value=format_time_pair(application.get("voting_end_at")), inline=False)
@@ -133,6 +141,7 @@ def build_continuous_public_event_embed(config: dict[str, Any], application: dic
     color = {
         CONT_APP_APPROVED: COLOR_GREEN,
         CONT_APP_REJECTED: COLOR_RED,
+        CONT_APP_RETURNED: COLOR_GRAY,
         CONT_APP_WITHDRAWN: COLOR_YELLOW,
         CONT_APP_APPROVED_WITHDRAWN: COLOR_GRAY,
         CONT_APP_CANCELLED: COLOR_GRAY,
@@ -231,6 +240,68 @@ def build_continuous_vote_status_embed(config: dict[str, Any], application: dict
     else:
         embed.add_field(name="你的选择", value="尚未支持" if mode == CONT_MODE_SUPPORT else "尚未投票", inline=True)
     embed.set_footer(text=f"Application ID: {application['id']}")
+    return embed
+
+
+def build_continuous_application_list_embed(
+    config: dict[str, Any],
+    applications: list[dict[str, Any]],
+    *,
+    page: int,
+    page_size: int,
+) -> discord.Embed:
+    total = len(applications)
+    total_pages = max(1, (total + int(page_size) - 1) // int(page_size))
+    page = min(max(0, int(page)), total_pages - 1)
+    start = page * int(page_size)
+    rows = applications[start : start + int(page_size)]
+    embed = discord.Embed(
+        title=f"当前报名人名单｜{sanitize_public_text(config.get('name'), max_len=120)}",
+        color=COLOR_BLUE,
+    )
+    if not rows:
+        embed.description = "当前没有进行中的报名。"
+    else:
+        lines = []
+        for idx, app in enumerate(rows, start=start + 1):
+            display_name = _format_display_name(app)
+            user_id = int(app.get("user_id") or 0)
+            field_name = sanitize_public_text(app.get("field_name"), max_len=40, fallback="未选择岗位")
+            submitted = format_discord_ts(app.get("submitted_at"), style="f", fallback="未设置")
+            deadline = format_discord_ts(app.get("voting_end_at"), style="R", fallback="未设置")
+            lines.append(f"{idx}. {display_name}｜ID {user_id}｜{field_name}｜报名 {submitted}｜截止 {deadline}")
+        embed.description = "\n".join(lines)[:4000]
+    embed.set_footer(text=f"Continuous Config ID: {config['id']}｜进行中 {total} 人｜第 {page + 1}/{total_pages} 页")
+    return embed
+
+
+def build_continuous_application_lookup_embed(
+    config: dict[str, Any],
+    application: dict[str, Any],
+    *,
+    jump_url: str | None = None,
+) -> discord.Embed:
+    status = str(application.get("status") or "")
+    status_label = CONT_APPLICATION_STATUS_LABELS.get(status, status)
+    color = COLOR_BLUE if status == CONT_APP_VOTING else COLOR_GRAY
+    embed = discord.Embed(
+        title=f"当前报名人详情｜{sanitize_public_text(config.get('name'), max_len=120)}",
+        color=color,
+        description="该申请仍在进行中。" if status == CONT_APP_VOTING else f"该申请已结束：{status_label}。",
+    )
+    user_id = int(application.get("user_id") or 0)
+    embed.add_field(name="报名时昵称", value=_format_display_name(application), inline=True)
+    embed.add_field(name="用户ID", value=str(user_id) if user_id else "未知", inline=True)
+    embed.add_field(name="提及", value=_format_user(application), inline=True)
+    embed.add_field(name="申请岗位", value=sanitize_public_text(application.get("field_name"), max_len=80), inline=True)
+    embed.add_field(name="当前状态", value=status_label, inline=True)
+    embed.add_field(name="报名时间", value=format_time_pair(application.get("submitted_at")), inline=False)
+    embed.add_field(name="预计截止", value=format_time_pair(application.get("voting_end_at")), inline=False)
+    embed.add_field(name="投票消息", value="可点击下方按钮跳转。" if jump_url else "暂不可用：尚未记录投票消息或频道。", inline=False)
+    reason = str(application.get("status_reason") or "").strip()
+    if reason:
+        embed.add_field(name="状态说明", value=sanitize_public_text(reason, max_len=1000), inline=False)
+    embed.set_footer(text=f"Continuous Config ID: {config['id']}｜Application ID: {application['id']}")
     return embed
 
 
