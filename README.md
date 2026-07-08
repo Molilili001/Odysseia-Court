@@ -140,6 +140,11 @@ BOT_MAX_MESSAGE_CACHE=200
 ARCHIVE_CONCURRENCY=1
 ARCHIVE_MEDIA_BUDGET_MB=0
 ARCHIVE_SINGLE_IMAGE_MAX_MB=0
+APPROVED_API_ENABLED=false
+APPROVED_API_HOST=127.0.0.1
+APPROVED_API_PORT=8787
+APPROVED_API_TOKENS=
+APPROVED_API_MAX_LIMIT=500
 ```
 
 字段说明：
@@ -152,6 +157,11 @@ ARCHIVE_SINGLE_IMAGE_MAX_MB=0
 - `ARCHIVE_CONCURRENCY`：同时归档数量，可选。
 - `ARCHIVE_MEDIA_BUDGET_MB`：归档媒体总预算，可选；`0` 表示不限制。
 - `ARCHIVE_SINGLE_IMAGE_MAX_MB`：单张图片归档上限，可选；`0` 表示不限制。
+- `APPROVED_API_ENABLED`：是否启用常态通过名单只读 API，默认 `false`。
+- `APPROVED_API_HOST`：API 监听地址，默认 `127.0.0.1`；建议保持本机监听并通过 Cloudflare Tunnel 暴露。
+- `APPROVED_API_PORT`：API 监听端口，默认 `8787`。
+- `APPROVED_API_TOKENS`：API Bearer Token 列表，逗号/空格/分号分隔；启用 API 时必填。
+- `APPROVED_API_MAX_LIMIT`：单次通过名单查询最大返回数量，默认 `500`，程序上限 `1000`。
 
 > 频道、分类、身份组不需要写入 `.env`，请在 Discord 内使用 `/议诉 设置`、`/监察 设置` 与 `/募选 创建` 等指令配置。
 
@@ -338,6 +348,47 @@ python main.py
 - `/募选 常态 打回申请需要修改`：管理员打回投票中的申请；申请人不会进入冷却期，可修改后重新提交。
 - `/募选 常态 拒绝申请进入冷却`：管理员拒绝投票中的申请，并按配置写入冷却期。
 - `/募选 常态 移除通过`：管理员将成员移出通过名单，并写入冷却期。
+
+### 常态通过名单 API（可选）
+
+启用后，Bot 会在同一 Python 进程内启动一个只读 HTTP API，用于其他 VPS 上的 Bot 获取常态申请通过名单。API 与 Discord Bot 同启同关；如果你用 systemd 控制 `python main.py`，不需要额外创建第二个 service。
+
+推荐 `.env`：
+
+```env
+APPROVED_API_ENABLED=true
+APPROVED_API_HOST=127.0.0.1
+APPROVED_API_PORT=8787
+APPROVED_API_TOKENS=替换为长随机token
+```
+
+Cloudflare Tunnel Public Hostname 可指向：
+
+```text
+approved-api.example.com -> http://127.0.0.1:8787
+```
+
+健康检查：
+
+```http
+GET /healthz
+```
+
+通过名单查询：
+
+```http
+GET /v1/continuous/approved?guild_id=123&config_id=1&field_name=管理组&limit=100
+Authorization: Bearer <token>
+```
+
+参数说明：
+
+- `guild_id`：必填，Discord 服务器 ID。
+- `config_id`：可选，常态申请配置 ID。
+- `field_name`：可选，岗位名，精确匹配。
+- `limit`：可选，默认 `100`，受 `APPROVED_API_MAX_LIMIT` 限制。
+
+返回中的 `guild_id` 与 `user_id` 使用字符串，避免其他语言处理 Discord snowflake 时丢失精度。建议在 Cloudflare 侧额外启用 Access Service Token，让外部 Bot 同时携带 `CF-Access-Client-Id`、`CF-Access-Client-Secret` 与应用层 `Authorization`。
 
 ---
 

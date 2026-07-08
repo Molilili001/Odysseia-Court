@@ -31,6 +31,13 @@ def _parse_int_env(name: str, default: int, *, minimum: int | None = None, maxim
     return value
 
 
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on", "启用", "开启"}
+
+
 def _parse_int_sequence(value: str | None) -> tuple[int, ...]:
     """Parse comma/space/semicolon separated integer IDs, preserving order and removing duplicates."""
 
@@ -44,6 +51,23 @@ def _parse_int_sequence(value: str | None) -> tuple[int, ...]:
             continue
         item = int(part)
         if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return tuple(out)
+
+
+def _parse_str_sequence(value: str | None) -> tuple[str, ...]:
+    """Parse comma/space/semicolon separated non-empty strings, preserving order."""
+
+    if not value:
+        return ()
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[,;，；\s]+", value.strip()):
+        item = part.strip()
+        if not item or item in seen:
             continue
         seen.add(item)
         out.append(item)
@@ -83,6 +107,13 @@ class Config:
     archive_media_budget_mb: int  # 0 表示不限制，保持完整离线归档能力
     archive_single_image_max_mb: int  # 0 表示不限制，保持完整离线归档能力
 
+    # 常态通过名单只读 API（默认关闭；建议仅监听 127.0.0.1 并通过 Cloudflare Tunnel 暴露）
+    approved_api_enabled: bool
+    approved_api_host: str
+    approved_api_port: int
+    approved_api_tokens: tuple[str, ...]
+    approved_api_max_limit: int
+
 
 def load_config() -> Config:
     load_dotenv()
@@ -103,6 +134,14 @@ def load_config() -> Config:
     archive_concurrency = _parse_int_env("ARCHIVE_CONCURRENCY", 1, minimum=1, maximum=3)
     archive_media_budget_mb = _parse_int_env("ARCHIVE_MEDIA_BUDGET_MB", 0, minimum=0, maximum=4096)
     archive_single_image_max_mb = _parse_int_env("ARCHIVE_SINGLE_IMAGE_MAX_MB", 0, minimum=0, maximum=4096)
+    approved_api_enabled = _parse_bool_env("APPROVED_API_ENABLED", False)
+    approved_api_host = os.getenv("APPROVED_API_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    approved_api_port = _parse_int_env("APPROVED_API_PORT", 8787, minimum=1, maximum=65535)
+    approved_api_tokens = _parse_str_sequence(os.getenv("APPROVED_API_TOKENS"))
+    approved_api_max_limit = _parse_int_env("APPROVED_API_MAX_LIMIT", 500, minimum=1, maximum=1000)
+
+    if approved_api_enabled and not approved_api_tokens:
+        raise RuntimeError("APPROVED_API_ENABLED=true 时必须设置 APPROVED_API_TOKENS")
 
     return Config(
         token=token,
@@ -113,4 +152,9 @@ def load_config() -> Config:
         archive_concurrency=archive_concurrency,
         archive_media_budget_mb=archive_media_budget_mb,
         archive_single_image_max_mb=archive_single_image_max_mb,
+        approved_api_enabled=approved_api_enabled,
+        approved_api_host=approved_api_host,
+        approved_api_port=approved_api_port,
+        approved_api_tokens=approved_api_tokens,
+        approved_api_max_limit=approved_api_max_limit,
     )

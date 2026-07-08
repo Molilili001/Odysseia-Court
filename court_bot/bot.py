@@ -4,10 +4,8 @@ import asyncio
 import gc
 import io
 import logging
-import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
@@ -37,6 +35,7 @@ from .embeds import (
     build_court_started_dm_content,
     build_opening_post_embed,
 )
+from .api import ApprovedListApiServer
 from .services.audit import send_audit_log
 from .services.archive_export import build_archive
 from .services.db import CaseRepo, Database, GuildSettingsRepo
@@ -73,6 +72,7 @@ class CourtBot(commands.Bot):
         self._case_locks: dict[int, asyncio.Lock] = {}
         self._archive_semaphore = asyncio.Semaphore(config.archive_concurrency)
         self._turn_timeout_tasks: dict[int, asyncio.Task] = {}
+        self._approved_api = ApprovedListApiServer(self)
 
     # -------------------- 权限/工具方法 --------------------
 
@@ -298,63 +298,6 @@ class CourtBot(commands.Bot):
             return await self.get_channel_or_thread(int(tid))
         return None
 
-
-    # -------------------- 标题生成 --------------------
-
-    @staticmethod
-    def _clean_title_part(text: str, max_len: int) -> str:
-        text = (text or "").strip().replace("\n", " ").replace("\r", " ")
-        text = re.sub(r"\s+", "", text)
-        # 避免出现类似 <@123>、<#123> 的奇怪展示
-        text = text.replace("<", "").replace(">", "")
-        return text[:max_len]
-
-    async def _get_member_display_name(self, guild: discord.Guild, user_id: int) -> str:
-        member = guild.get_member(user_id)
-        if member is None:
-            try:
-                member = await guild.fetch_member(user_id)
-            except Exception:
-                member = None
-        if member is None:
-            return str(user_id)
-        return member.display_name
-
-    async def build_court_title(self, case: dict, guild: discord.Guild) -> str:
-        """生成开始议诉空间标题。
-
-        格式（用户要求）：
-        时间｜投诉人名投诉被投诉人名｜违反：xxxx
-        """
-
-        # 使用 UTC+8（香港/大陆时间），用于标题展示
-        tz = None
-        try:
-            tz = ZoneInfo("Asia/Hong_Kong")
-        except Exception:
-            tz = None
-
-        now = datetime.now(tz) if tz else datetime.now()
-        # 可读格式：YYYY-MM-DD HH:MM
-        time_str = now.strftime("%Y-%m-%d %H:%M")
-
-        complainant_name = self._clean_title_part(
-            await self._get_member_display_name(guild, int(case["complainant_id"])),
-            12,
-        )
-        defendant_name = self._clean_title_part(
-            await self._get_member_display_name(guild, int(case["defendant_id"])),
-            12,
-        )
-
-        rule_text = self._clean_title_part(str(case.get("rule_text", "")), 20)
-        if not rule_text:
-            rule_text = "未知规则"
-
-        # 去掉前缀，使用更明显的分隔符
-        title = f"{time_str}｜{complainant_name}投诉{defendant_name}｜违反：{rule_text}"
-        return title[:100]
-
     # -------------------- 生命周期 --------------------
 
     async def setup_hook(self) -> None:
@@ -365,6 +308,9 @@ class CourtBot(commands.Bot):
         await self.load_extension("court_bot.cogs.court")
         await self.load_extension("court_bot.inspection.cog")
         await self.load_extension("court_bot.election.cog")
+
+        # 常态通过名单只读 API。放在募选 Cog 加载后启动，确保常态申请表已初始化。
+        await self._approved_api.start()
 
         # 启用指令本地化（让 locale_str 生效）
         # 没有 translator 的情况下，Discord 只会看到内部英文名，例如 /court show_settings
@@ -409,6 +355,8 @@ class CourtBot(commands.Bot):
                 log.exception("Failed to sync commands globally")
 
     async def close(self) -> None:
+        await self._approved_api.close()
+
         for task in list(self._turn_timeout_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -737,13 +685,11 @@ class CourtBot(commands.Bot):
             )
 
         name = f"case-{int(case['id']):04d}"
-        court_title = await self.build_court_title(case, guild)
         vis_label = "公开" if approved_visibility == VIS_PUBLIC else "私密"
         channel = await guild.create_text_channel(
             name=name,
             category=category,
             overwrites=overwrites,
-            topic=f"{court_title}（{vis_label}）",
         )
 
         await self.repo.set_court_space(int(case["id"]), court_channel_id=channel.id, court_thread_id=None)
