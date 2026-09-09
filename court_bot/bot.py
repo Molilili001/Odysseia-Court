@@ -308,6 +308,7 @@ class CourtBot(commands.Bot):
         await self.load_extension("court_bot.cogs.court")
         await self.load_extension("court_bot.inspection.cog")
         await self.load_extension("court_bot.election.cog")
+        await self.load_extension("court_bot.cogs.bot_message")
 
         # 常态通过名单只读 API。放在募选 Cog 加载后启动，确保常态申请表已初始化。
         await self._approved_api.start()
