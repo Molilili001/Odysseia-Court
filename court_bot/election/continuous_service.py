@@ -6,7 +6,7 @@ from typing import Any
 
 import discord
 
-from .constants import MAX_SELF_INTRO_LENGTH
+from .constants import MAX_DURATION_MINUTES, MAX_SELF_INTRO_LENGTH
 from .continuous_constants import (
     CONT_APP_APPROVED,
     CONT_APP_APPROVED_WITHDRAWN,
@@ -468,6 +468,44 @@ class ContinuousApplicationService:
             {"config_id": int(config["id"]), "user_ids": targets, "cleared": int(cleared)},
         )
         return cleared, targets, config
+
+    async def update_cooldown(
+        self,
+        *,
+        guild: discord.Guild,
+        config_id: int | None,
+        cooldown_minutes: int,
+        operator_id: int,
+        refresh_entry: bool = True,
+    ) -> tuple[int, int, dict[str, Any], bool]:
+        """修改常态申请的冷却期规则。
+
+        · 只影响此后新结算、新退出所写出的 cooldown_until。
+        · 已写入申请记录的 cooldown_until 不受影响，要提前解除请用 clear_cooldown。
+        · refresh_entry：顺带刷新入口面板，使新数值立即对外可见。
+        返回 (旧分钟数, 新分钟数, 最新 config, 入口是否刷新成功)。
+        """
+        minutes = int(cooldown_minutes)
+        if minutes < 0:
+            raise ValueError("冷却期必须大于或等于 0。")
+        if minutes > MAX_DURATION_MINUTES:
+            raise ValueError("冷却期过长，单阶段最多 30 天。")
+        config = await self.repo.resolve_config(int(guild.id), int(config_id) if config_id is not None else None)
+        old_minutes = int(config.get("cooldown_minutes") or 0)
+        changed = await self.repo.set_cooldown_minutes(int(config["id"]), minutes)
+        if not changed:
+            raise ValueError("未找到该常态申请配置。")
+        fresh = await self.repo.get_config(int(config["id"])) or config
+        refreshed = False
+        if refresh_entry:
+            refreshed = await self.refresh_entry(fresh, reason="cooldown_updated", operator_id=operator_id)
+        await self._log(
+            int(guild.id),
+            int(operator_id),
+            "continuous_cooldown_updated",
+            {"config_id": int(fresh["id"]), "old_minutes": old_minutes, "new_minutes": minutes, "entry_refreshed": bool(refreshed)},
+        )
+        return old_minutes, minutes, fresh, refreshed
 
     async def confirm_exit(self, interaction: discord.Interaction, *, config_id: int, application_id: int, mode: str) -> None:
         if interaction.guild is None:

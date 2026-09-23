@@ -59,7 +59,7 @@ from .publicity_service import PublicityService
 from .result_service import ResultService
 from .scheduler import ElectionScheduler
 from .text_utils import contains_forbidden_mention, sanitize_public_text
-from .time_utils import build_schedule, format_time_pair, parse_duration_minutes, to_utc_iso, utc_now, utc_now_iso
+from .time_utils import build_schedule, format_time_pair, human_duration, parse_duration_minutes, to_utc_iso, utc_now, utc_now_iso
 from .views import FieldSelectView, RegistrationEntryView, RegistrationIntroModal, VoteEntryView
 from .vote_service import VoteService
 
@@ -553,6 +553,52 @@ class ContinuousElectionGroup(app_commands.Group):
             )
         except Exception as exc:
             await interaction.edit_original_response(content=f"清除冷却失败：{exc}")
+
+    @app_commands.command(name=locale_str("set_cooldown", zh_CN="设置冷却", zh_TW="設定冷卻", en_US="set_cooldown", en_GB="set_cooldown"), description="修改常态申请的冷却期；只影响此后新产生的冷却，已写入记录请用清除冷却处理")
+    @app_commands.rename(
+        cooldown_duration=locale_str("cooldown_duration", zh_CN="冷却期", zh_TW="冷卻期", en_US="冷却期", en_GB="冷却期"),
+        config_id=locale_str("config_id", zh_CN="配置id", zh_TW="配置id", en_US="配置id", en_GB="配置id"),
+        refresh=locale_str("refresh", zh_CN="刷新入口", zh_TW="刷新入口", en_US="refresh_entry", en_GB="refresh_entry"),
+    )
+    @app_commands.describe(
+        cooldown_duration="新的冷却期，例如 7天、72小时、2天6小时、90分钟；填 0 表示不冷却",
+        config_id="常态申请配置 ID；不填时若只有一个配置则自动选择",
+        refresh="是否顺带刷新入口面板使新数值立即生效；不填默认刷新",
+    )
+    async def set_cooldown(
+        self,
+        interaction: discord.Interaction,
+        cooldown_duration: str,
+        config_id: int | None = None,
+        refresh: bool = True,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not await self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            minutes = parse_duration_minutes(cooldown_duration, allow_zero=True, label="冷却期")
+            old_minutes, new_minutes, config, refreshed = await self.cog.continuous.update_cooldown(
+                guild=interaction.guild,
+                config_id=config_id,
+                cooldown_minutes=minutes,
+                operator_id=interaction.user.id,
+                refresh_entry=refresh,
+            )
+            lines = [
+                f"【{config['name']}】冷却期已更新：{human_duration(old_minutes)} → {human_duration(new_minutes)}",
+                "新数值对之后新产生的冷却生效；已写入记录的到期时间不变，需提前解除请用『清除冷却』。",
+            ]
+            if refresh:
+                lines.append("入口面板：" + ("已刷新。" if refreshed else "未刷新（未记录入口消息或无法编辑），可稍后手动执行『刷新展示』。"))
+            else:
+                lines.append("入口面板未刷新，可执行『刷新展示』更新显示数值。")
+            await interaction.edit_original_response(content="\n".join(lines)[:1900], allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"设置冷却失败：{exc}")
 
 
 class ElectionGroup(app_commands.Group):

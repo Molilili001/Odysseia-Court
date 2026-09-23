@@ -281,6 +281,27 @@ class ContinuousApplicationRepo:
             (int(message_id), int(channel_id) if channel_id else None, utc_now_iso(), int(config_id)),
         )
 
+    async def set_cooldown_minutes(self, config_id: int, minutes: int) -> bool:
+        """修改配置的冷却期时长（分钟）。
+
+        只改规则值，不动任何已写入申请的 cooldown_until。
+        """
+        if self.db.conn is None:
+            raise RuntimeError("DB not connected")
+        async with self.lock:
+            cur = await self.db.conn.execute(
+                """
+                UPDATE pe_continuous_configs
+                SET cooldown_minutes=?, updated_at=?
+                WHERE id=?
+                """,
+                (int(minutes), utc_now_iso(), int(config_id)),
+            )
+            changed = cur.rowcount > 0
+            await cur.close()
+            await self.db.conn.commit()
+        return changed
+
     async def find_config_by_entry_message(self, guild_id: int, message_id: int) -> dict[str, Any] | None:
         row = await self.db.fetchone(
             """
