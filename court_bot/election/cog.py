@@ -500,6 +500,60 @@ class ContinuousElectionGroup(app_commands.Group):
         except Exception as exc:
             await interaction.edit_original_response(content=f"移除失败：{exc}")
 
+    @app_commands.command(name=locale_str("clear_cooldown", zh_CN="清除冷却", zh_TW="清除冷卻", en_US="clear_cooldown", en_GB="clear_cooldown"), description="清除常态申请冷却期，支持单个成员、指定身份组或该配置全体")
+    @app_commands.choices(
+        scope=[
+            Choice(name="全部（该配置所有仍在冷却中的成员）", value="all"),
+        ]
+    )
+    @app_commands.rename(
+        config_id=locale_str("config_id", zh_CN="配置id", zh_TW="配置id", en_US="配置id", en_GB="配置id"),
+        member=locale_str("member", zh_CN="成员", zh_TW="成員", en_US="成员", en_GB="成员"),
+        role=locale_str("role", zh_CN="身份组", zh_TW="身分組", en_US="身份组", en_GB="身份组"),
+        scope=locale_str("scope", zh_CN="范围", zh_TW="範圍", en_US="范围", en_GB="范围"),
+    )
+    @app_commands.describe(
+        config_id="常态申请配置 ID；不填时若只有一个配置则自动选择",
+        member="仅清除该成员的冷却；可与身份组同时使用，取交集",
+        role="清除该身份组内所有仍在冷却成员的冷却；可与成员同时使用，取交集",
+        scope="填 全部 才做群体清除；只填成员或身份组时仅精确清除对应成员",
+    )
+    async def clear_cooldown(
+        self,
+        interaction: discord.Interaction,
+        config_id: int | None = None,
+        member: discord.Member | None = None,
+        role: discord.Role | None = None,
+        scope: Choice[str] | None = None,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
+            return
+        if not await self._admin(interaction):
+            await interaction.response.send_message("无权限。", ephemeral=True)
+            return
+        if member is None and role is None and (scope is None or str(scope.value) != "all"):
+            await interaction.response.send_message("请至少指定成员、身份组，或将范围设置为 全部。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            cleared, targets, config = await self.cog.continuous.clear_cooldown(
+                guild=interaction.guild,
+                config_id=config_id,
+                operator_id=interaction.user.id,
+                user_ids=[member.id] if member is not None else None,
+                role_id=role.id if role is not None else None,
+            )
+            if cleared == 0:
+                await interaction.edit_original_response(content=f"【{config['name']}】当前没有需要清除的冷却记录。")
+                return
+            scope_text = "全体成员" if targets is None else f"{len(targets)} 名成员"
+            await interaction.edit_original_response(
+                content=f"【{config['name']}】已为{scope_text}清除 {cleared} 条冷却记录，可立即重新申请。"
+            )
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"清除冷却失败：{exc}")
+
 
 class ElectionGroup(app_commands.Group):
     def __init__(self, cog: "ElectionCog"):

@@ -426,6 +426,49 @@ class ContinuousApplicationService:
     def _cooldown_until(self, config: dict[str, Any]) -> str:
         return to_utc_iso(utc_now() + timedelta(minutes=int(config.get("cooldown_minutes") or 0)))
 
+    async def clear_cooldown(
+        self,
+        *,
+        guild: discord.Guild,
+        config_id: int | None,
+        operator_id: int,
+        user_ids: list[int] | None = None,
+        role_id: int | None = None,
+    ) -> tuple[int, list[int] | None, dict[str, Any]]:
+        """清除常态申请冷却期。
+
+        · user_ids 与 role_id 都为空：清除该配置下全部仍在生效的冷却。
+        · 否则：先取仍在冷却中的成员，再按成员列表或身份组求交集，避免误清。
+        只清 cooldown_until，不改 status，因此历史、公示与审计记录保持不变。
+        """
+        config = await self.repo.resolve_config(int(guild.id), int(config_id) if config_id is not None else None)
+        now = utc_now_iso()
+        targets: list[int] | None = None
+        if user_ids or role_id is not None:
+            pool = {int(row["user_id"]) for row in await self.repo.list_active_cooldowns(int(config["id"]), now)}
+            if role_id is not None:
+                role = guild.get_role(int(role_id))
+                if role is None:
+                    raise ValueError(f"找不到身份组：{role_id}")
+                pool &= {int(member.id) for member in role.members}
+            if user_ids:
+                pool &= {int(uid) for uid in user_ids}
+            targets = sorted(pool)
+            if not targets:
+                return 0, targets, config
+            cleared = 0
+            for uid in targets:
+                cleared += await self.repo.clear_cooldown(int(config["id"]), now, user_id=uid)
+        else:
+            cleared = await self.repo.clear_cooldown(int(config["id"]), now)
+        await self._log(
+            int(guild.id),
+            int(operator_id),
+            "continuous_cooldown_cleared",
+            {"config_id": int(config["id"]), "user_ids": targets, "cleared": int(cleared)},
+        )
+        return cleared, targets, config
+
     async def confirm_exit(self, interaction: discord.Interaction, *, config_id: int, application_id: int, mode: str) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)

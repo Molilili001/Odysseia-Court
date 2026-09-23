@@ -480,6 +480,37 @@ class ContinuousApplicationRepo:
         )
         return str(row["cooldown_until"]) if row else None
 
+    async def list_active_cooldowns(self, config_id: int, now_iso: str) -> list[dict[str, Any]]:
+        rows = await self.db.fetchall(
+            """
+            SELECT user_id, MAX(cooldown_until) AS cooldown_until
+            FROM pe_continuous_applications
+            WHERE config_id=? AND cooldown_until IS NOT NULL AND cooldown_until>?
+            GROUP BY user_id
+            """,
+            (int(config_id), now_iso),
+        )
+        return [dict(row) for row in rows]
+
+    async def clear_cooldown(self, config_id: int, now_iso: str, user_id: int | None = None) -> int:
+        sql = """
+            UPDATE pe_continuous_applications
+            SET cooldown_until=NULL, updated_at=?
+            WHERE config_id=? AND cooldown_until IS NOT NULL AND cooldown_until>?
+        """
+        params: list[Any] = [now_iso, int(config_id), now_iso]
+        if user_id is not None:
+            sql += " AND user_id=?"
+            params.append(int(user_id))
+        if self.db.conn is None:
+            raise RuntimeError("DB not connected")
+        async with self.lock:
+            cur = await self.db.conn.execute(sql, tuple(params))
+            changed = int(cur.rowcount or 0)
+            await cur.close()
+            await self.db.conn.commit()
+        return changed
+
     async def list_due_applications(self, now_iso: str) -> list[dict[str, Any]]:
         rows = await self.db.fetchall(
             """
