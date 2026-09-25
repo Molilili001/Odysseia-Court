@@ -9,6 +9,10 @@ from .continuous_constants import (
     CONT_APP_APPROVED,
     CONT_APP_REJECTED,
     CONT_APP_VOTING,
+    CONT_APP_REVIEW_AREA_PENDING,
+    CONT_APP_REVIEWING,
+    CONT_APP_REVIEW_TIMEOUT,
+    CONT_APP_REVIEW_PUBLISH_PENDING,
     CONT_CONFIG_ACTIVE,
     CONT_MODE_APPROVAL,
     CONT_MODE_SUPPORT,
@@ -38,6 +42,7 @@ CREATE TABLE IF NOT EXISTS pe_continuous_configs (
   min_total_votes INTEGER NOT NULL,
   approval_threshold_percent REAL NOT NULL,
   support_target_votes INTEGER,
+  approved_role_id INTEGER,
   voting_duration_minutes INTEGER NOT NULL,
   cooldown_minutes INTEGER NOT NULL,
   created_by INTEGER NOT NULL,
@@ -79,6 +84,11 @@ CREATE TABLE IF NOT EXISTS pe_continuous_applications (
   cooldown_until TEXT,
   result_json TEXT,
   status_reason TEXT,
+  reapply_locked INTEGER NOT NULL DEFAULT 0,
+  role_grant_role_id INTEGER,
+  role_grant_status TEXT NOT NULL DEFAULT 'not_required',
+  role_grant_error TEXT,
+  role_grant_next_retry_at TEXT,
   updated_at TEXT NOT NULL,
   FOREIGN KEY(config_id) REFERENCES pe_continuous_configs(id) ON DELETE CASCADE
 );
@@ -103,6 +113,73 @@ CREATE TABLE IF NOT EXISTS pe_continuous_vote_records (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pe_cont_vote_app_choice ON pe_continuous_vote_records(application_id, choice);
+
+CREATE TABLE IF NOT EXISTS pe_continuous_review_settings (
+  config_id INTEGER PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  approve_threshold INTEGER NOT NULL DEFAULT 1,
+  reject_threshold INTEGER NOT NULL DEFAULT 1,
+  reviewer_role_ids TEXT NOT NULL DEFAULT '[]',
+  review_channel_id INTEGER,
+  pass_dm_template TEXT,
+  reject_dm_template TEXT,
+  archive_channel_id INTEGER,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(config_id) REFERENCES pe_continuous_configs(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS pe_continuous_reviews (
+  application_id INTEGER PRIMARY KEY,
+  snapshot_json TEXT NOT NULL,
+  thread_id INTEGER,
+  panel_message_id INTEGER,
+  panel_dirty INTEGER NOT NULL DEFAULT 1,
+  panel_revision INTEGER NOT NULL DEFAULT 0,
+  reminder_sent INTEGER NOT NULL DEFAULT 0,
+  review_started_at TEXT,
+  review_deadline_at TEXT,
+  threshold_choice TEXT,
+  outcome TEXT,
+  completed_at TEXT,
+  dm_status TEXT NOT NULL DEFAULT 'pending',
+  dm_error TEXT,
+  archive_message_id INTEGER,
+  archive_locked INTEGER NOT NULL DEFAULT 0,
+  archive_error TEXT,
+  thread_claimed_at TEXT,
+  publish_claimed_at TEXT,
+  archive_claimed_at TEXT,
+  thread_log_claimed_at TEXT,
+  FOREIGN KEY(application_id) REFERENCES pe_continuous_applications(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS pe_continuous_review_votes (
+  application_id INTEGER NOT NULL,
+  reviewer_id INTEGER NOT NULL,
+  reviewer_name TEXT NOT NULL,
+  choice TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(application_id, reviewer_id),
+  FOREIGN KEY(application_id) REFERENCES pe_continuous_applications(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS pe_continuous_review_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  application_id INTEGER NOT NULL,
+  actor_id INTEGER,
+  event_type TEXT NOT NULL,
+  old_choice TEXT,
+  new_choice TEXT,
+  reason TEXT,
+  detail_json TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(application_id) REFERENCES pe_continuous_applications(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_pe_cont_review_events_app ON pe_continuous_review_events(application_id,id);
+CREATE TABLE IF NOT EXISTS pe_continuous_review_thread_logs (
+  event_id INTEGER PRIMARY KEY,
+  message_id INTEGER NOT NULL,
+  FOREIGN KEY(event_id) REFERENCES pe_continuous_review_events(id) ON DELETE CASCADE
+);
 """
 
 
@@ -131,6 +208,13 @@ class ContinuousApplicationRepo:
         alter_sqls = [
             "ALTER TABLE pe_continuous_configs ADD COLUMN mode TEXT NOT NULL DEFAULT 'approval_vote'",
             "ALTER TABLE pe_continuous_configs ADD COLUMN support_target_votes INTEGER",
+            "ALTER TABLE pe_continuous_configs ADD COLUMN approved_role_id INTEGER",
+            "ALTER TABLE pe_continuous_applications ADD COLUMN reapply_locked INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE pe_continuous_applications ADD COLUMN role_grant_role_id INTEGER",
+            "ALTER TABLE pe_continuous_applications ADD COLUMN role_grant_status TEXT NOT NULL DEFAULT 'not_required'",
+            "ALTER TABLE pe_continuous_applications ADD COLUMN role_grant_error TEXT",
+            "ALTER TABLE pe_continuous_applications ADD COLUMN role_grant_next_retry_at TEXT",
+            "ALTER TABLE pe_continuous_reviews ADD COLUMN thread_log_claimed_at TEXT",
         ]
         for sql in alter_sqls:
             try:
@@ -174,6 +258,7 @@ class ContinuousApplicationRepo:
         fields: list[str],
         mode: str = CONT_MODE_APPROVAL,
         support_target_votes: int | None = None,
+        approved_role_id: int | None = None,
     ) -> int:
         now = utc_now_iso()
         mode = str(mode or CONT_MODE_APPROVAL)
@@ -193,9 +278,9 @@ class ContinuousApplicationRepo:
                     INSERT INTO pe_continuous_configs(
                       guild_id, name, status, entry_channel_id, voting_channel_id, public_channel_id,
                       allowed_application_role_ids, allowed_voter_role_ids,
-                      mode, min_total_votes, approval_threshold_percent, support_target_votes, voting_duration_minutes, cooldown_minutes,
+                      mode, min_total_votes, approval_threshold_percent, support_target_votes, approved_role_id, voting_duration_minutes, cooldown_minutes,
                       created_by, created_at, updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         int(guild_id),
@@ -210,6 +295,7 @@ class ContinuousApplicationRepo:
                         int(min_total_votes),
                         float(approval_threshold_percent),
                         int(support_target_votes) if support_target_votes is not None else None,
+                        int(approved_role_id) if approved_role_id is not None else None,
                         int(voting_duration_minutes),
                         int(cooldown_minutes),
                         int(created_by),
@@ -324,6 +410,7 @@ class ContinuousApplicationRepo:
         field_name: str,
         self_intro: str,
         voting_end_at: str,
+        review_snapshot: dict[str, Any] | None = None,
     ) -> int:
         now = utc_now_iso()
         if self.db.conn is None:
@@ -333,26 +420,32 @@ class ContinuousApplicationRepo:
                 await self.db.conn.execute("BEGIN IMMEDIATE")
                 cur = await self.db.conn.execute(
                     """
-                    SELECT id, status, cooldown_until
+                    SELECT id, status, cooldown_until, reapply_locked
                     FROM pe_continuous_applications
                     WHERE config_id=? AND user_id=?
                       AND (
-                        status IN (?, ?)
+                        status IN (?, ?, ?, ?, ?, ?)
+                        OR reapply_locked=1
                         OR (cooldown_until IS NOT NULL AND cooldown_until>?)
                       )
                     ORDER BY id DESC LIMIT 1
                     """,
-                    (int(config["id"]), int(user_id), CONT_APP_VOTING, CONT_APP_APPROVED, now),
+                    (int(config["id"]), int(user_id), CONT_APP_VOTING, CONT_APP_APPROVED,
+                     CONT_APP_REVIEW_AREA_PENDING, CONT_APP_REVIEWING, CONT_APP_REVIEW_TIMEOUT,
+                     CONT_APP_REVIEW_PUBLISH_PENDING, now),
                 )
                 blocker = await cur.fetchone()
                 await cur.close()
                 if blocker:
                     status = str(blocker["status"] or "")
                     cooldown_until = blocker["cooldown_until"]
-                    if status == CONT_APP_VOTING:
+                    if status in (CONT_APP_VOTING, CONT_APP_REVIEW_AREA_PENDING, CONT_APP_REVIEWING,
+                                  CONT_APP_REVIEW_TIMEOUT, CONT_APP_REVIEW_PUBLISH_PENDING):
                         raise ValueError(f"你已有进行中的申请（Application ID: {blocker['id']}），不能重复申请。")
                     if status == CONT_APP_APPROVED:
                         raise ValueError("你已经在该常态申请中通过，不能重复申请；如需退出通过名单，请点击入口里的『退出申请』。")
+                    if blocker["reapply_locked"]:
+                        raise ValueError("本场前置审核拒绝后禁止重新申请，请联系募选管理员。")
                     raise ValueError(f"你仍在冷却期内，冷却结束：{cooldown_until}。")
 
                 cur = await self.db.conn.execute(
@@ -360,8 +453,8 @@ class ContinuousApplicationRepo:
                     INSERT INTO pe_continuous_applications(
                       config_id, guild_id, user_id, display_name, username,
                       field_key, field_name, self_intro, status,
-                      submitted_at, voting_end_at, updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                      submitted_at, voting_end_at, role_grant_role_id, updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         int(config["id"]),
@@ -372,14 +465,20 @@ class ContinuousApplicationRepo:
                         str(field_key),
                         field_name,
                         self_intro,
-                        CONT_APP_VOTING,
+                        CONT_APP_REVIEW_AREA_PENDING if review_snapshot else CONT_APP_VOTING,
                         now,
                         voting_end_at,
+                        int(config["approved_role_id"]) if config.get("approved_role_id") else None,
                         now,
                     ),
                 )
                 application_id = int(cur.lastrowid)
                 await cur.close()
+                if review_snapshot:
+                    await self.db.conn.execute(
+                        "INSERT INTO pe_continuous_reviews(application_id,snapshot_json) VALUES(?,?)",
+                        (application_id, _json_dumps(review_snapshot)),
+                    )
                 await self.db.conn.commit()
                 return application_id
             except Exception:
@@ -461,10 +560,11 @@ class ContinuousApplicationRepo:
         row = await self.db.fetchone(
             """
             SELECT * FROM pe_continuous_applications
-            WHERE config_id=? AND user_id=? AND status=?
+            WHERE config_id=? AND user_id=? AND status IN (?,?,?,?,?)
             ORDER BY id DESC LIMIT 1
             """,
-            (int(config_id), int(user_id), CONT_APP_VOTING),
+            (int(config_id), int(user_id), CONT_APP_VOTING, CONT_APP_REVIEW_AREA_PENDING,
+             CONT_APP_REVIEWING, CONT_APP_REVIEW_TIMEOUT, CONT_APP_REVIEW_PUBLISH_PENDING),
         )
         return dict(row) if row else None
 
@@ -743,7 +843,9 @@ class ContinuousApplicationRepo:
                     """
                     UPDATE pe_continuous_applications
                     SET status=?, status_reason=?, cooldown_until=COALESCE(?, cooldown_until),
-                        result_json=?, closed_at=COALESCE(?, closed_at), updated_at=?
+                        result_json=?, closed_at=COALESCE(?, closed_at), updated_at=?,
+                        role_grant_status=CASE WHEN ?='support_collection' AND ?='approved' AND role_grant_role_id IS NOT NULL
+                          THEN 'pending' ELSE role_grant_status END
                     WHERE id=? AND status=?
                     """,
                     (
@@ -753,6 +855,8 @@ class ContinuousApplicationRepo:
                         _json_dumps(result),
                         now,
                         now,
+                        mode,
+                        status,
                         int(application_id),
                         CONT_APP_VOTING,
                     ),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 import discord
 from discord import app_commands
@@ -31,6 +32,8 @@ from .constants import (
     VOTE_YES,
 )
 from .database import InspectionDatabase
+from .member_application_service import MemberApplicationRepo, MemberApplicationService
+from .member_application_embeds import entry_embed
 from .settings_service import InspectionSettingsService
 from .utils import format_dt, is_server_admin
 from .vote_service import VoteService
@@ -62,6 +65,94 @@ class InspectionGroup(app_commands.Group):
             ),
         )
         self.cog = cog
+
+    @app_commands.command(name=locale_str("member_application_settings", zh_CN="申请设置", zh_TW="申請設定", en_US="申请设置", en_GB="申请设置"), description="配置监察组正式成员申请")
+    @app_commands.rename(enabled="启用", prerequisite_role="前置身份组", inspector_role="监察组身份组",
+                         approve_threshold="同意票阈值", reject_threshold="拒绝票阈值",
+                         reject_cooldown_days="拒绝冷却天数", review_thread_channel="审核子区",
+                         review_thread="审核子区链接或id",
+                         pass_dm_template="通过私信模板", reject_dm_template="拒绝私信模板")
+    @app_commands.describe(review_thread_channel="选择一个现有 Thread", review_thread="Thread 链接或 ID 兜底")
+    async def member_application_settings(self, interaction: discord.Interaction,
+        enabled: bool | None = None, prerequisite_role: discord.Role | None = None,
+        inspector_role: discord.Role | None = None, approve_threshold: int | None = None,
+        reject_threshold: int | None = None, reject_cooldown_days: int | None = None,
+        review_thread_channel: discord.Thread | None = None, review_thread: str | None = None,
+        pass_dm_template: str | None = None,
+        reject_dm_template: str | None = None) -> None:
+        if interaction.guild is None or not _admin_required(interaction):
+            await interaction.response.send_message("无权限（仅服务器所有者或 Administrator）。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            current = await self.cog.member_repo.get_settings(interaction.guild.id)
+            changed = any(value is not None for value in (enabled, prerequisite_role, inspector_role,
+                approve_threshold, reject_threshold, reject_cooldown_days, review_thread_channel, review_thread,
+                pass_dm_template, reject_dm_template))
+            values = dict(current)
+            for key, value in (("enabled", enabled), ("prerequisite_role_id", prerequisite_role.id if prerequisite_role else None),
+                               ("inspector_role_id", inspector_role.id if inspector_role else None),
+                               ("approve_threshold", approve_threshold), ("reject_threshold", reject_threshold),
+                               ("reject_cooldown_days", reject_cooldown_days),
+                               ("pass_dm_template", pass_dm_template), ("reject_dm_template", reject_dm_template)):
+                if value is not None:
+                    values[key] = value
+            if review_thread_channel and review_thread:
+                raise ValueError("审核子区选择器与链接/ID 只需填写一项。")
+            if review_thread_channel is not None:
+                values["review_thread_id"] = review_thread_channel.id
+            if review_thread is not None:
+                match = re.search(r"(\d{15,25})\s*$", review_thread.strip())
+                if not match:
+                    raise ValueError("审核子区请填写有效的 Thread 链接或 ID。")
+                values["review_thread_id"] = int(match.group(1))
+            if changed:
+                if values["enabled"]:
+                    if not all((values["prerequisite_role_id"], values["inspector_role_id"], values["review_thread_id"])):
+                        raise ValueError("启用前请配置两个身份组和审核子区。")
+                    if not interaction.guild.get_role(int(values["prerequisite_role_id"])) or not interaction.guild.get_role(int(values["inspector_role_id"])):
+                        raise ValueError("配置的身份组不存在。")
+                    thread = await self.cog.member_applications.get_thread(int(values["review_thread_id"]))
+                    if thread is None or thread.guild.id != interaction.guild.id:
+                        raise ValueError("审核位置必须是当前服务器已有的 Thread。")
+                    me = interaction.guild.me
+                    role = interaction.guild.get_role(int(values["inspector_role_id"]))
+                    if me is None or not me.guild_permissions.manage_roles or me.top_role <= role:
+                        raise ValueError("Bot 缺少 Manage Roles 或监察组身份组层级不足。")
+                    if not role.mentionable and not me.guild_permissions.mention_everyone:
+                        raise ValueError("监察组身份组不可提及，Bot 需要 Mention Everyone / Roles 权限。")
+                    perms = thread.permissions_for(me) if me else None
+                    required = ("view_channel", "send_messages_in_threads", "read_message_history", "embed_links")
+                    missing = [name for name in required if not perms or not getattr(perms, name, False)]
+                    if missing:
+                        raise ValueError("Bot 在审核子区缺少权限：" + "、".join(missing))
+                values = await self.cog.member_repo.save_settings(interaction.guild.id, **{
+                    key: values[key] for key in ("enabled", "prerequisite_role_id", "inspector_role_id",
+                    "approve_threshold", "reject_threshold", "reject_cooldown_days", "review_thread_id",
+                    "pass_dm_template", "reject_dm_template")})
+            await interaction.edit_original_response(content=("监察组申请设置已保存。" if changed else "当前监察组申请设置：") +
+                f"\n启用：{bool(values['enabled'])}\n前置身份组：{values['prerequisite_role_id']}"
+                f"\n监察组身份组：{values['inspector_role_id']}\n同意/拒绝阈值：{values['approve_threshold']}/{values['reject_threshold']}"
+                f"\n拒绝冷却：{values['reject_cooldown_days']} 天\n审核子区：{values['review_thread_id']}")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"设置失败：{exc}")
+
+    @app_commands.command(name=locale_str("member_application_panel", zh_CN="申请面板", zh_TW="申請面板", en_US="申请面板", en_GB="申请面板"), description="在当前频道发送监察组正式成员申请入口")
+    async def member_application_panel(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not _admin_required(interaction):
+            await interaction.response.send_message("无权限（仅服务器所有者或 Administrator）。", ephemeral=True)
+            return
+        if interaction.channel is None or not hasattr(interaction.channel, "send"):
+            await interaction.response.send_message("当前频道无法发送面板。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            settings = await self.cog.member_repo.get_settings(interaction.guild.id)
+            msg = await interaction.channel.send(embed=entry_embed(settings), view=self.cog.member_applications.entry_view(),
+                allowed_mentions=discord.AllowedMentions.none())
+            await interaction.edit_original_response(content=f"已发送监察组申请面板：{msg.jump_url}")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"发送面板失败：{exc}")
 
     @app_commands.command(
         name=locale_str("setup", zh_CN="设置", zh_TW="設定", en_US="设置", en_GB="设置"),
@@ -494,6 +585,8 @@ class InspectionCog(commands.Cog):
         self.case_service = CaseService(bot, self.db, self.settings_service, self.candidate_service)
         self.vote_service = VoteService(bot, self.db, self.settings_service)
         self.archive_service = InspectionArchiveService(bot, self.db, self.settings_service)
+        self.member_repo = MemberApplicationRepo(self.db)
+        self.member_applications = MemberApplicationService(bot, self.member_repo)
 
         self.group = InspectionGroup(self)
         self._registered_guilds: list[discord.Object] = []
@@ -507,6 +600,10 @@ class InspectionCog(commands.Cog):
     async def cog_load(self) -> None:
         await self.db.connect()
         await self.db.init_schema()
+        self.bot.add_view(self.member_applications.entry_view())
+        self.bot.add_view(self.member_applications.review_view())
+        if not self.member_application_maintenance_loop.is_running():
+            self.member_application_maintenance_loop.start()
         if not self.candidate_maintenance_loop.is_running():
             self.candidate_maintenance_loop.start()
         if not self.case_maintenance_loop.is_running():
@@ -514,6 +611,7 @@ class InspectionCog(commands.Cog):
         log.info("Inspection cog loaded")
 
     async def cog_unload(self) -> None:
+        self.member_application_maintenance_loop.cancel()
         self.candidate_maintenance_loop.cancel()
         self.case_maintenance_loop.cancel()
         try:
@@ -534,6 +632,17 @@ class InspectionCog(commands.Cog):
             await self.candidate_service.process_expired_candidate_confirmations()
         except Exception:
             log.exception("Inspection candidate maintenance tick failed")
+
+    @tasks.loop(minutes=10)
+    async def member_application_maintenance_loop(self) -> None:
+        try:
+            await self.member_applications.maintenance()
+        except Exception:
+            log.exception("Inspection member application maintenance tick failed")
+
+    @member_application_maintenance_loop.before_loop
+    async def before_member_application_maintenance_loop(self) -> None:
+        await self.bot.wait_until_ready()
 
     @candidate_maintenance_loop.before_loop
     async def before_candidate_maintenance_loop(self) -> None:
@@ -563,7 +672,7 @@ class InspectionCog(commands.Cog):
     @commands.Cog.listener("on_interaction")
     async def on_inspection_interaction(self, interaction: discord.Interaction) -> None:
         custom_id = interaction.data.get("custom_id") if isinstance(interaction.data, dict) else None
-        if not isinstance(custom_id, str) or not custom_id.startswith("insp_"):
+        if not isinstance(custom_id, str) or not custom_id.startswith("insp_") or custom_id.startswith("insp_member_"):
             return
 
         # 只接管监察模块自定义按钮。

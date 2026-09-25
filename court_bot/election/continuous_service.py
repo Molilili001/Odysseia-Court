@@ -14,6 +14,10 @@ from .continuous_constants import (
     CONT_APP_REJECTED,
     CONT_APP_RETURNED,
     CONT_APP_VOTING,
+    CONT_APP_REVIEW_AREA_PENDING,
+    CONT_APP_REVIEWING,
+    CONT_APP_REVIEW_TIMEOUT,
+    CONT_APP_REVIEW_PUBLISH_PENDING,
     CONT_APP_WITHDRAWN,
     CONT_MODE_APPROVAL,
     CONT_MODE_SUPPORT,
@@ -55,6 +59,7 @@ class ContinuousApplicationService:
         self.bot = bot
         self.repo = repo
         self.audit_repo = audit_repo
+        self.review_service = None
 
     async def ensure_schema(self) -> None:
         await self.repo.ensure_schema()
@@ -150,6 +155,10 @@ class ContinuousApplicationService:
         approved = await self.repo.get_approved_application(int(config["id"]), int(member.id))
         if approved:
             return "你已经在该常态申请中通过，不能重复申请；如需退出通过名单，请点击入口里的『退出申请』。"
+        locked = await self.repo.db.fetchone("""SELECT id FROM pe_continuous_applications WHERE config_id=?
+            AND user_id=? AND reapply_locked=1 LIMIT 1""", (int(config["id"]), int(member.id)))
+        if locked:
+            return "本场前置审核拒绝后禁止重新申请，请联系募选管理员解除限制。"
         cooldown_until = await self.repo.get_active_cooldown(int(config["id"]), int(member.id), utc_now_iso())
         if cooldown_until:
             return f"你仍在冷却期内，冷却结束：{format_time_pair(cooldown_until)}。"
@@ -213,6 +222,7 @@ class ContinuousApplicationService:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         voting_end_at = to_utc_iso(utc_now() + timedelta(minutes=int(config.get("voting_duration_minutes") or 0)))
+        review_settings = await self.review_service.repo.get_settings(int(config["id"])) if self.review_service else {"enabled": 0}
         try:
             application_id = await self.repo.create_application(
                 config=config,
@@ -223,6 +233,7 @@ class ContinuousApplicationService:
                 field_name=sanitize_public_text(field.get("name"), max_len=80, fallback=str(field["field_key"])),
                 self_intro=str(self_intro or "").strip(),
                 voting_end_at=voting_end_at,
+                review_snapshot=review_settings if review_settings.get("enabled") else None,
             )
         except ValueError as exc:
             await interaction.edit_original_response(content=str(exc))
@@ -230,6 +241,14 @@ class ContinuousApplicationService:
         application = await self.repo.get_application(application_id)
         if not application:
             await interaction.edit_original_response(content="申请创建失败，请稍后重试。")
+            return
+        if review_settings.get("enabled"):
+            try:
+                await self.review_service.ensure_thread(application)
+                await interaction.edit_original_response(content=f"申请 #{application_id} 已提交，正在进行前置管理审核。")
+            except Exception as exc:
+                log.exception("Cannot create continuous review thread for %s", application_id)
+                await interaction.edit_original_response(content=f"申请 #{application_id} 已保存，等待创建审核区；Bot 将每 10 分钟重试。错误：{str(exc)[:120]}")
             return
         channel = await self._get_text_channel(int(config.get("voting_channel_id") or 0))
         if channel is None:
@@ -399,6 +418,14 @@ class ContinuousApplicationService:
             return
         active = await self.repo.get_active_application(int(config["id"]), int(interaction.user.id))
         if active:
+            if active["status"] in (CONT_APP_REVIEW_AREA_PENDING, CONT_APP_REVIEWING,
+                                    CONT_APP_REVIEW_TIMEOUT, CONT_APP_REVIEW_PUBLISH_PENDING):
+                await interaction.response.send_message(
+                    "确认撤回当前申请并进入冷却期？",
+                    view=ContinuousExitConfirmView(service=self, config_id=int(config["id"]),
+                        application_id=int(active["id"]), mode="review", user_id=int(interaction.user.id)),
+                    ephemeral=True)
+                return
             vote_end = parse_iso(active.get("voting_end_at"))
             if vote_end is not None and utc_now() >= vote_end:
                 await interaction.response.defer(ephemeral=True, thinking=True)
@@ -517,6 +544,12 @@ class ContinuousApplicationService:
             await interaction.response.edit_message(content="未找到可退出的申请。", embed=None, view=None)
             return
         cooldown_until = self._cooldown_until(config)
+        if mode == "review" and self.review_service:
+            changed = await self.review_service.withdraw(application)
+            await interaction.response.edit_message(
+                content=f"已撤回申请。冷却结束：{format_time_pair(cooldown_until)}。" if changed else "该申请已结束，无法撤回。",
+                embed=None, view=None)
+            return
         if mode == "active":
             fresh = await self.repo.get_application(int(application_id)) or application
             if fresh.get("status") != CONT_APP_VOTING:
@@ -772,6 +805,8 @@ class ContinuousApplicationService:
         if finalized is None:
             return None
         updated, result = finalized
+        if result.get("passed") and self._config_mode(config) == CONT_MODE_SUPPORT and updated.get("role_grant_role_id") and self.review_service:
+            await self.review_service.retry_grant_role(updated)
         await self._edit_vote_message(config, updated, result=result)
         event = f"{'通过' if result['passed'] else '未通过'}：<@{int(updated.get('user_id') or 0)}> 申请「{sanitize_public_text(updated.get('field_name'), max_len=80)}」。"
         await self._publish_result_event(config, updated, event, result=result)
