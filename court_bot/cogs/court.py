@@ -235,10 +235,12 @@ class CourtGroup(app_commands.Group):
             await interaction.response.send_message("无法读取成员权限信息。", ephemeral=True)
             return
 
-        # 初始化阶段不能依赖“已配置的管理身份组”，因此这里用 Discord 原生权限兜底
+        # 保留 Discord 原生权限兜底（初始化阶段名单可能尚未写入），
+        # 并兼容 admin_role_ids 已登记的管理身份组
         if not (
             interaction.user.guild_permissions.administrator
             or interaction.user.guild_permissions.manage_guild
+            or await self.bot.is_admin(interaction.user, interaction.guild)
         ):
             await interaction.response.send_message("无权限（需要 管理服务器 或 管理员 权限）。", ephemeral=True)
             return
