@@ -12,6 +12,11 @@ from .continuous_constants import (
     CONT_APP_REJECTED,
     CONT_APP_RETURNED,
     CONT_APP_VOTING,
+    CONT_APP_REVIEW_AREA_PENDING,
+    CONT_APP_REVIEWING,
+    CONT_APP_REVIEW_TIMEOUT,
+    CONT_APP_REVIEW_PUBLISH_PENDING,
+    CONT_APP_REVIEW_REJECTED,
     CONT_APP_WITHDRAWN,
     CONT_APPLICATION_STATUS_LABELS,
     CONT_MODE_APPROVAL,
@@ -197,7 +202,12 @@ def build_continuous_my_status_embed(
         embed.description = f"最近申请状态：{CONT_APPLICATION_STATUS_LABELS.get(status, status)}"
         embed.add_field(name="申请岗位", value=sanitize_public_text(application.get("field_name"), max_len=80), inline=True)
         embed.add_field(name="提交时间", value=format_time_pair(application.get("submitted_at")), inline=False)
-        embed.add_field(name="投票结束", value=format_time_pair(application.get("voting_end_at")), inline=False)
+        if status in (CONT_APP_REVIEW_AREA_PENDING, CONT_APP_REVIEWING, CONT_APP_REVIEW_TIMEOUT,
+                      CONT_APP_REVIEW_PUBLISH_PENDING, CONT_APP_REVIEW_REJECTED) or (
+                      status == CONT_APP_WITHDRAWN and not application.get("vote_message_id")):
+            embed.add_field(name="公众投票", value="尚未开始。" if status != CONT_APP_REVIEW_REJECTED else "前置审核拒绝，未进入公众投票。", inline=False)
+        else:
+            embed.add_field(name="投票结束", value=format_time_pair(application.get("voting_end_at")), inline=False)
         result = ContinuousApplicationRepo.decode_result(application.get("result_json"))
         if result:
             if _result_mode(result, config) == CONT_MODE_SUPPORT:

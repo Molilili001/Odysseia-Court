@@ -43,6 +43,7 @@ from .continuous_constants import (
 )
 from .continuous_logic import parse_continuous_fields_config
 from .continuous_service import ContinuousApplicationService
+from .continuous_review_service import ContinuousReviewRepo, ContinuousReviewService
 from .database import ElectionRepo
 from .embeds import (
     build_election_list_embed,
@@ -189,6 +190,7 @@ class ContinuousElectionGroup(app_commands.Group):
         application_roles=locale_str("application_roles", zh_CN="允许申请身份组", zh_TW="允許申請身分組", en_US="允许申请身份组", en_GB="允许申请身份组"),
         voting_roles=locale_str("voting_roles", zh_CN="允许投票身份组", zh_TW="允許投票身分組", en_US="允许投票身份组", en_GB="允许投票身份组"),
         send_entry=locale_str("send_entry", zh_CN="立即发送入口", zh_TW="立即發送入口", en_US="立即发送入口", en_GB="立即发送入口"),
+        approved_role=locale_str("approved_role", zh_CN="通过后身份组", zh_TW="通過後身分組", en_US="通过后身份组", en_GB="通过后身份组"),
     )
     @app_commands.choices(
         mode=[
@@ -211,6 +213,7 @@ class ContinuousElectionGroup(app_commands.Group):
         application_roles="允许申请身份组 ID/提及，逗号分隔；不填表示所有成员可申请",
         voting_roles="允许投票身份组 ID/提及，逗号分隔；不填表示所有成员可投票",
         send_entry="是否创建后立即发送长期入口",
+        approved_role="仅支持票收集正式通过后自动发放的单个身份组；可选",
     )
     async def create(
         self,
@@ -229,6 +232,7 @@ class ContinuousElectionGroup(app_commands.Group):
         application_roles: str | None = None,
         voting_roles: str | None = None,
         send_entry: bool = True,
+        approved_role: discord.Role | None = None,
     ) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("请在服务器内使用。", ephemeral=True)
@@ -253,6 +257,12 @@ class ContinuousElectionGroup(app_commands.Group):
                     raise ValueError("支持票收集模式必须填写支持目标票数。")
                 if int(support_target_votes) < 1:
                     raise ValueError("支持目标票数必须大于 0。")
+            if approved_role is not None and mode_value != CONT_MODE_SUPPORT:
+                raise ValueError("通过后身份组只适用于支持票收集模式。")
+            if approved_role is not None:
+                me = interaction.guild.me
+                if me is None or not me.guild_permissions.manage_roles or me.top_role <= approved_role:
+                    raise ValueError("Bot 缺少 Manage Roles 或身份组层级不足，无法发放通过后身份组。")
             min_total_votes = int(min_total_votes) if min_total_votes is not None else CONT_DEFAULT_MIN_TOTAL_VOTES
             approval_threshold_percent = float(approval_threshold_percent) if approval_threshold_percent is not None else CONT_DEFAULT_APPROVAL_THRESHOLD_PERCENT
             voting_duration = (voting_duration or CONT_DEFAULT_VOTING_DURATION_TEXT).strip() or CONT_DEFAULT_VOTING_DURATION_TEXT
@@ -283,6 +293,7 @@ class ContinuousElectionGroup(app_commands.Group):
                 fields=fields,
                 mode=mode_value,
                 support_target_votes=int(support_target_votes) if support_target_votes is not None else None,
+                approved_role_id=approved_role.id if approved_role else None,
             )
             config = await self.cog.continuous_repo.get_config(config_id)
             if config and send_entry:
@@ -291,6 +302,95 @@ class ContinuousElectionGroup(app_commands.Group):
             await interaction.edit_original_response(content=f"已创建常态申请配置 #{config_id}。{' 已发送入口。' if send_entry else ''}")
         except Exception as exc:
             await interaction.edit_original_response(content=f"创建常态申请失败：{exc}")
+
+    @app_commands.command(name=locale_str("review_settings", zh_CN="审核设置", zh_TW="審核設定", en_US="审核设置", en_GB="审核设置"), description="配置常态申请的可选前置审核")
+    @app_commands.rename(config_id="配置id", enabled="启用", approve_threshold="支持票阈值",
+        reject_threshold="反对票阈值", review_channel="审核频道", reviewer_roles="审核员身份组",
+        pass_dm_template="通过私信模板", reject_dm_template="拒绝私信模板", archive_location="归档位置")
+    @app_commands.describe(reviewer_roles="多个身份组 ID/提及，空格或逗号分隔", archive_location="文字频道或 Thread 的链接/ID")
+    async def review_settings(self, interaction: discord.Interaction, enabled: bool,
+        config_id: int | None = None, approve_threshold: int | None = None,
+        reject_threshold: int | None = None, review_channel: discord.TextChannel | None = None,
+        reviewer_roles: str | None = None, pass_dm_template: str | None = None,
+        reject_dm_template: str | None = None, archive_location: str | None = None) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not (
+            interaction.guild.owner_id == interaction.user.id or interaction.user.guild_permissions.administrator):
+            await interaction.response.send_message("无权限（仅服务器所有者或 Administrator）。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            config = await self.cog.continuous_repo.resolve_config(interaction.guild.id, config_id)
+            current = await self.cog.continuous_review_repo.get_settings(config["id"])
+            values = {"approve_threshold": approve_threshold if approve_threshold is not None else current.get("approve_threshold", 1),
+                "reject_threshold": reject_threshold if reject_threshold is not None else current.get("reject_threshold", 1),
+                "reviewer_role_ids": parse_role_ids_from_text(reviewer_roles) if reviewer_roles is not None else current.get("reviewer_role_ids", []),
+                "review_channel_id": review_channel.id if review_channel else current.get("review_channel_id"),
+                "pass_dm_template": pass_dm_template if pass_dm_template is not None else current.get("pass_dm_template"),
+                "reject_dm_template": reject_dm_template if reject_dm_template is not None else current.get("reject_dm_template"),
+                "archive_channel_id": current.get("archive_channel_id")}
+            if archive_location is not None:
+                match = re.search(r"(\d{15,25})\s*$", archive_location.strip())
+                if not match:
+                    raise ValueError("归档位置请填写文字频道或 Thread 链接/ID。")
+                values["archive_channel_id"] = int(match.group(1))
+            if enabled:
+                self._validate_role_ids(interaction.guild, values["reviewer_role_ids"], "审核员")
+                channel = interaction.guild.get_channel(int(values["review_channel_id"] or 0))
+                if not isinstance(channel, discord.TextChannel):
+                    raise ValueError("审核频道必须是当前服务器的普通文字频道。")
+                archive = self.cog.bot.get_channel(int(values["archive_channel_id"] or 0))
+                if archive is None:
+                    archive = await self.cog.bot.fetch_channel(int(values["archive_channel_id"] or 0))
+                if not isinstance(archive, (discord.TextChannel, discord.Thread)) or archive.guild.id != interaction.guild.id:
+                    raise ValueError("归档位置必须是当前服务器的文字频道或 Thread。")
+                me = interaction.guild.me
+                for role_id in values["reviewer_role_ids"]:
+                    role = interaction.guild.get_role(role_id)
+                    if role and not role.mentionable and (me is None or not me.guild_permissions.mention_everyone):
+                        raise ValueError(f"审核员身份组 {role_id} 不可提及，Bot 需要 Mention Everyone / Roles 权限。")
+                for label, target, required in (("审核频道", channel, ("view_channel", "send_messages", "read_message_history",
+                    "embed_links", "create_public_threads", "send_messages_in_threads", "manage_threads", "attach_files")),
+                    ("归档位置", archive, ("view_channel", "send_messages_in_threads" if isinstance(archive, discord.Thread) else "send_messages",
+                    "read_message_history", "embed_links", "attach_files"))):
+                    perms = target.permissions_for(me) if me else None
+                    missing = [key for key in required if not perms or not getattr(perms, key, False)]
+                    if missing:
+                        raise ValueError(f"Bot 在{label}缺少权限：{'、'.join(missing)}")
+            await self.cog.continuous_review_repo.save_settings(config["id"], enabled=enabled, **values)
+            await interaction.edit_original_response(content=f"常态配置 #{config['id']} 前置审核已{'启用' if enabled else '关闭'}。已进入审核的申请继续使用原配置快照。")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"审核设置失败：{exc}")
+
+    @app_commands.command(name=locale_str("review_manage", zh_CN="审核处理", zh_TW="審核處理", en_US="审核处理", en_GB="审核处理"), description="管理常态申请前置审核异常或人工处理")
+    @app_commands.rename(application_id="申请id", action="操作", reason="理由")
+    @app_commands.choices(action=[Choice(name="手动通过", value="approve"), Choice(name="手动拒绝", value="reject"),
+        Choice(name="解除重新申请限制", value="unlock"), Choice(name="重试创建审核区", value="retry_thread"),
+        Choice(name="重新发布公众投票", value="retry_vote")])
+    async def review_manage(self, interaction: discord.Interaction, application_id: int,
+                            action: Choice[str], reason: str | None = None) -> None:
+        if interaction.guild is None or not await self._admin(interaction):
+            await interaction.response.send_message("无募选管理权限。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            app = await self.cog.continuous_repo.get_application(application_id)
+            if not app or app["guild_id"] != interaction.guild.id or not await self.cog.continuous_review_repo.get_review(application_id):
+                raise ValueError("未找到当前服务器的前置审核申请。")
+            if action.value in ("approve", "reject"):
+                changed = await self.cog.continuous_review.manual(application_id, "yes" if action.value == "approve" else "no",
+                    interaction.user.id, reason)
+            elif action.value == "unlock":
+                changed = await self.cog.continuous_review_repo.unlock_reapplication(application_id)
+                if changed:
+                    await self.cog.continuous_review_repo.add_event(application_id, interaction.user.id, "manual_unlock", reason)
+            elif action.value == "retry_thread":
+                await self.cog.continuous_review.ensure_thread(app)
+                changed = True
+            else:
+                changed = await self.cog.continuous_review.publish_public_vote(application_id)
+            await interaction.edit_original_response(content="操作已完成。" if changed else "申请状态不允许该操作，或目标暂不可用。")
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"审核处理失败：{exc}")
 
     @app_commands.command(name=locale_str("entry", zh_CN="入口", zh_TW="入口", en_US="入口", en_GB="入口"), description="发送或重发常态申请入口")
     @app_commands.rename(
@@ -1273,6 +1373,9 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
         self.result_service = ResultService(self.repo)
         self.vote_service = VoteService(bot, self.repo)
         self.continuous = ContinuousApplicationService(bot, self.continuous_repo, self.repo)
+        self.continuous_review_repo = ContinuousReviewRepo(self.continuous_repo)
+        self.continuous_review = ContinuousReviewService(bot, self.continuous, self.continuous_review_repo)
+        self.continuous.review_service = self.continuous_review
         self.scheduler = ElectionScheduler(self)
         self.group = ElectionGroup(self)
         self._registered_guilds: list[discord.Object] = []
@@ -1297,6 +1400,7 @@ class ElectionCog(commands.Cog, name="ElectionCog"):
         self.bot.add_view(self.continuous.entry_view())
         self.bot.add_view(self.continuous.vote_view(CONT_MODE_APPROVAL))
         self.bot.add_view(self.continuous.vote_view(CONT_MODE_SUPPORT))
+        self.bot.add_view(self.continuous_review.view())
         self.scheduler.start()
         log.info("Election cog loaded")
 

@@ -151,6 +151,78 @@ CREATE TABLE IF NOT EXISTS inspection_case_archives (
 
 CREATE INDEX IF NOT EXISTS idx_inspection_case_archives_case
   ON inspection_case_archives(case_id, created_at);
+
+CREATE TABLE IF NOT EXISTS inspection_member_application_settings (
+  guild_id INTEGER PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  prerequisite_role_id INTEGER,
+  inspector_role_id INTEGER,
+  approve_threshold INTEGER NOT NULL DEFAULT 1,
+  reject_threshold INTEGER NOT NULL DEFAULT 1,
+  reject_cooldown_days INTEGER NOT NULL DEFAULT 1,
+  review_thread_id INTEGER,
+  pass_dm_template TEXT,
+  reject_dm_template TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inspection_member_applications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  display_name TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL,
+  settings_snapshot_json TEXT NOT NULL,
+  review_message_id INTEGER,
+  panel_claimed_at TEXT,
+  panel_dirty INTEGER NOT NULL DEFAULT 1,
+  panel_revision INTEGER NOT NULL DEFAULT 0,
+  review_thread_id INTEGER NOT NULL,
+  reminder_sent INTEGER NOT NULL DEFAULT 0,
+  submitted_at TEXT NOT NULL,
+  completed_at TEXT,
+  cooldown_until TEXT,
+  dm_status TEXT NOT NULL DEFAULT 'pending',
+  dm_error TEXT,
+  dm_attempted_at TEXT,
+  role_grant_status TEXT NOT NULL DEFAULT 'not_required',
+  role_grant_error TEXT,
+  role_grant_next_retry_at TEXT,
+  role_grant_attempted_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inspection_member_one_open
+  ON inspection_member_applications(guild_id, user_id) WHERE status='reviewing';
+CREATE INDEX IF NOT EXISTS idx_inspection_member_retry
+  ON inspection_member_applications(status, role_grant_status, role_grant_next_retry_at);
+
+CREATE TABLE IF NOT EXISTS inspection_member_application_votes (
+  application_id INTEGER NOT NULL,
+  reviewer_id INTEGER NOT NULL,
+  reviewer_name TEXT NOT NULL,
+  choice TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(application_id, reviewer_id),
+  FOREIGN KEY(application_id) REFERENCES inspection_member_applications(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS inspection_member_application_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  application_id INTEGER NOT NULL,
+  actor_id INTEGER,
+  event_type TEXT NOT NULL,
+  old_choice TEXT,
+  new_choice TEXT,
+  reason TEXT,
+  detail_json TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(application_id) REFERENCES inspection_member_applications(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_inspection_member_events_app
+  ON inspection_member_application_events(application_id, id);
 """
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 from discord.ext import tasks
 
@@ -18,6 +19,7 @@ log = logging.getLogger(__name__)
 class ElectionScheduler:
     def __init__(self, cog):
         self.cog = cog
+        self._last_review_maintenance = None
 
     def start(self) -> None:
         if not self.loop.is_running():
@@ -49,6 +51,12 @@ class ElectionScheduler:
             await self.cog.continuous.finalize_due_applications()
         except Exception:
             log.exception("Failed to process continuous application scheduler")
+        if self._last_review_maintenance is None or now - self._last_review_maintenance >= timedelta(minutes=10):
+            try:
+                await self.cog.continuous_review.maintenance()
+                self._last_review_maintenance = now
+            except Exception:
+                log.exception("Failed to process continuous review maintenance")
 
     async def process_election(self, election: dict, *, now) -> None:
         status = str(election.get("status"))
